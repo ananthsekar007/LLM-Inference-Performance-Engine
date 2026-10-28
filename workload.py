@@ -7,7 +7,7 @@ def generate_workload(
     n_requests=50,
     seed=42,
     arrival_rate=5.0,
-    prompt_lengths=(32, 64, 128, 256, 512, 1024),
+    prompt_lengths=(32, 64, 128, 256, 512),
     output_lengths=(16, 32, 64, 128, 256),
 ):
     random.seed(seed)

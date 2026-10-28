@@ -94,8 +94,8 @@ def main():
     benchmark_case(model, 32, 4, dev)
 
     rows = []
-    for n in [128, 512, 1024]:
-        for m in [32, 128, 256]:
+    for n in [128, 256, 512, 768]:
+        for m in [32, 64, 128, 256]:
             print(f"Running prompt={n}, output={m}")
             rows.append(benchmark_case(model, n, m, dev))
 
