@@ -98,10 +98,22 @@ def main():
         for m in [32, 64, 128, 256]:
             print(f"Running prompt={n}, output={m}")
             rows.append(benchmark_case(model, n, m, dev))
+            rows[-1]["rep"] = 0
+            for rep in range(1, 3):
+                print(f"Running prompt={n}, output={m}, rep={rep}")
+                rows.append(benchmark_case(model, n, m, dev))
+                rows[-1]["rep"] = rep
 
     df = pd.DataFrame(rows)
     print(df)
     df.to_csv(args.out, index=False)
+
+    group_cols = ["prompt_length", "output_length"]
+    mean_df = df.groupby(group_cols).mean().reset_index().drop(columns=["rep"])
+    std_df = df.groupby(group_cols).std().reset_index().drop(columns=["rep"])
+    print(mean_df)
+    mean_df.to_csv(args.out.removesuffix(".csv") + "_mean.csv", index=False)
+    std_df.to_csv(args.out.removesuffix(".csv") + "_std.csv", index=False)
 
 
 if __name__ == "__main__":
