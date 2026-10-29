@@ -3,6 +3,27 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+def plot_lines(df, x, y, group, xlabel, ylabel, title, filename):
+    plt.figure()
+    for value, subset in df.groupby(group):
+        subset = subset.sort_values(x)
+        plt.plot(
+            subset[x],
+            subset[y],
+            marker="o",
+            label=f"{group}={value}",
+        )
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.ylim(bottom=0)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(f"{filename}.pdf", bbox_inches="tight")
+    plt.savefig(f"{filename}.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+
 def plot_part1(path):
     df = pd.read_csv(path)
 
@@ -26,6 +47,47 @@ def plot_part1(path):
             bbox_inches="tight",
         )
         plt.close()
+
+    plot_lines(
+        df,
+        x="prompt_length",
+        y="prefill_ms",
+        group="output_length",
+        xlabel="Prompt Length (tokens)",
+        ylabel="Prefill Latency (ms)",
+        title="Prompt Length vs Prefill Latency",
+        filename="part1_prefill_vs_prompt",
+    )
+    plot_lines(
+        df,
+        x="output_length",
+        y="decode_ms",
+        group="prompt_length",
+        xlabel="Output Length (tokens)",
+        ylabel="Decode Latency (ms)",
+        title="Output Length vs Decode Latency",
+        filename="part1_decode_vs_output",
+    )
+    plot_lines(
+        df,
+        x="output_length",
+        y="tpot_ms",
+        group="prompt_length",
+        xlabel="Output Length (tokens)",
+        ylabel="TPOT (ms/token)",
+        title="Output Length vs TPOT",
+        filename="part1_tpot_vs_output",
+    )
+    plot_lines(
+        df,
+        x="prompt_length",
+        y="tpot_ms",
+        group="output_length",
+        xlabel="Prompt Length (tokens)",
+        ylabel="TPOT (ms/token)",
+        title="Prompt Length vs TPOT",
+        filename="part1_tpot_vs_prompt",
+    )
 
 
 def plot_part2(path):
