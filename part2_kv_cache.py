@@ -217,6 +217,10 @@ def agreement_check(seq_cached, seq_uncached, prompt_length):
     exact_match = bool(matches.all())
     match_rate = matches.float().mean().item()
 
+    if not exact_match and bool(matches[0].all()):
+        mismatched = (~matches).any(dim=0).nonzero()
+        return exact_match, match_rate, int(mismatched[0].item())
+
     first_mismatch = None
     if not exact_match:
         first_mismatch = int((~matches[0]).nonzero()[0].item())
