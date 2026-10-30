@@ -99,6 +99,7 @@ def main():
     parser.add_argument("--out", default="part3_batching.csv")
     parser.add_argument("--prompt-length", type=int, default=128)
     parser.add_argument("--output-length", type=int, default=128)
+    parser.add_argument("--repeats", type=int, default=3)
     args = parser.parse_args()
 
     seed_everything(42)
@@ -115,7 +116,7 @@ def main():
 
     rows = []
 
-    for batch_size in [1, 2, 4, 8, 16]:
+    for batch_size in [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]:
         try:
             print(f"Running batch_size={batch_size}")
             rows.append(
@@ -127,6 +128,20 @@ def main():
                     dev=dev,
                 )
             )
+            rows[-1]["rep"] = 0
+
+            for rep in range(1, args.repeats):
+                print(f"Running batch_size={batch_size}, rep={rep}")
+                rows.append(
+                    benchmark_batch(
+                        model=model,
+                        batch_size=batch_size,
+                        prompt_length=args.prompt_length,
+                        output_length=args.output_length,
+                        dev=dev,
+                    )
+                )
+                rows[-1]["rep"] = rep
         except torch.cuda.OutOfMemoryError:
             print(f"OOM at batch_size={batch_size}; stopping.")
             break
@@ -134,6 +149,13 @@ def main():
     df = pd.DataFrame(rows)
     print(df)
     df.to_csv(args.out, index=False)
+
+    group_cols = ["batch_size", "prompt_length", "output_length"]
+    mean_df = df.groupby(group_cols).mean().reset_index().drop(columns=["rep"])
+    std_df = df.groupby(group_cols).std().reset_index().drop(columns=["rep"])
+    print(mean_df)
+    mean_df.to_csv(args.out.removesuffix(".csv") + "_mean.csv", index=False)
+    std_df.to_csv(args.out.removesuffix(".csv") + "_std.csv", index=False)
 
 
 if __name__ == "__main__":
