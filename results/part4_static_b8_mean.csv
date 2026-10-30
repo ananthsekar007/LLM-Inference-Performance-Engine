@@ -1,0 +1,2 @@
+batch_size,num_requests,total_time_sec,requests_per_sec,output_tokens_per_sec,generated_tokens_per_sec,mean_batch_latency_sec,p95_batch_latency_sec,mean_completion_sec,p95_completion_sec,prompt_padding_efficiency,output_efficiency
+8.0,50.0,11.40644493768923,4.383502386778918,402.5808592017758,1088.5113126849408,1.7701449416826167,1.8311409479938447,6.5898533398813255,10.952691324986517,0.4312500000000001,0.3698453608247423

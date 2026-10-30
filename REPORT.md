@@ -545,39 +545,191 @@ For gpt2 even batch 512 streams faster than people read (about 46 tokens/s per u
 
 | Parameter | Value |
 |---|---|
-| Requests | 50 (`python workload.py --n 50`) |
-| Arrival process | Poisson, rate 5 req/s (arrival times are not used by the offline scripts) |
-| Prompt lengths | {32, 64, 128, 256, 512}, uniform |
-| Output lengths | {16, 32, 64, 128, 256}, uniform |
-| Seed | 42 |
+| Requests | 50 (`python workload.py --n 50`, file `workload.json`) |
+| Seed | 42 (deterministic, so the same 50 requests are used by every script) |
+| Prompt lengths | {32, 64, 128, 256, 512} drawn uniformly. Actual counts: 11 × 32, 9 × 64, 9 × 128, 7 × 256, 14 × 512 |
+| Output lengths | {16, 32, 64, 128, 256} drawn uniformly. Actual counts: 11 × 16, 10 × 32, 14 × 64, 5 × 128, 10 × 256 |
+| Total useful tokens | **11,040** prompt tokens, **4,592** output tokens |
+| Arrival process | Poisson at 5 requests/s (the last arrival is at 12.0 s). Arrival times are **not** used: both offline scripts treat all 50 requests as available at t = 0 |
+
+Prompt lengths are capped at 512 (the starter workload also included 1024) so that every static batch (padded prompt + longest output ≤ 512 + 256) and every vLLM request fits gpt2's 1024-token context.
+
+Both systems ran on the same A100 in FP16. Each configuration was run 3 times after a warm-up, and the tables report the mean. All standard deviations were below 0.7%; they are in `results/part4_*_std.csv`.
 
 ### Task 4.1 — Static batching results
 
-_TODO: table of throughput, mean latency, P95 latency, padding efficiency for each batch size tested._
+`part4_static_batching.py` processes the workload in arrival order, in fixed groups of *B* requests. Each group is left-padded to its longest prompt and generated with `model.generate()` until its longest output is finished. We added `min_new_tokens = max_output` so a batch cannot stop early on EOS.
 
-**Padding example (128, 150, 180, 1024):** _TODO: useful tokens vs. tokens processed after padding, and the resulting efficiency._
+Two latency definitions are reported:
+- **Batch latency** is the starter's definition: the `generate()` time of the batch a request belongs to.
+- **Completion time** is the time from the start of the run until the request's batch finishes. Batches run one after another and every request is ready at t = 0, so this includes the time a request waits behind earlier batches.
+
+| Static batch size | 1 | 4 | 8 | 16 |
+|---|---:|---:|---:|---:|
+| Time for all 50 requests (s) | 28.50 | 17.51 | 11.41 | 5.97 |
+| **Throughput (requests/s)** | 1.75 | 2.86 | 4.38 | 8.37 |
+| **Output tokens/s** (useful) | 161 | 262 | 403 | 769 |
+| Generated tokens/s (incl. wasted) | 161 | 563 | 1,089 | 2,078 |
+| **Mean batch latency (s)** | 0.57 | 1.38 | 1.77 | 1.78 |
+| **P95 batch latency (s)** | 1.59 | 1.80 | 1.83 | 1.84 |
+| Mean completion time (s) | 12.77 | 8.60 | 6.59 | 3.77 |
+| P95 completion time (s) | 26.99 | 17.06 | 10.95 | 5.52 |
+| **Prompt-padding efficiency** | 1.000 | 0.513 | 0.431 | 0.431 |
+| Output (decode) efficiency | 1.000 | 0.466 | 0.370 | 0.370 |
+
+**Padding efficiency** is useful prompt tokens ÷ (batch size × longest prompt in the batch). **Output efficiency** is requested output tokens ÷ (batch size × longest output in the batch).
+
+Larger static batches raise throughput, since batching amortizes per-step overhead (Part 3), but efficiency falls.
+- At *B* ≥ 8 almost every batch contains both a 512-token prompt (14 of the 50 requests have one) and a 256-token output (10 of 50). Nearly every batch is therefore padded to 512 × 256. Only **43% of prompt positions and 37% of decode slots do useful work**, and batches 8 and 16 have identical efficiencies.
+- At batch 16 the GPU generates 2,078 tokens/s, but only 769 tokens/s belong to a request's actual output.
+- Batch latency grows with *B* (0.57 → 1.78 s) because every batch now runs for 256 decode steps, about 7.0 ms each at batch 16.
+
+**Why heterogeneous prompt lengths cause padding waste.** A batch is one rectangular tensor of shape [*B*, max prompt length]. Shorter prompts are filled with pad tokens; the attention mask stops other tokens from attending to them, but they still flow through every GEMM, every layer and the KV cache.
+
+For prompts of **128, 150, 180 and 1024** tokens:
+
+| | Tokens |
+|---|---:|
+| Useful prompt tokens | 128 + 150 + 180 + 1024 = **1,482** |
+| Processed after padding | 4 × 1024 = **4,096** |
+| Padding efficiency | 1,482 / 4,096 = **36.2%** |
+| Wasted pad positions | 2,614 (**63.8%**) |
+
+The linear layers do 2.76× more work than necessary. Attention is worse, because its cost grows with the square of sequence length: useful query-key pairs are (128² + 150² + 180² + 1024²) / (4 × 1024²) = **26.7%** of those computed. The KV cache is also sized for 4 × 1024 positions.
+
+A single long prompt sets the cost for the whole batch. Our measured 43–51% efficiency shows the same effect on the real workload. (A 1024-token prompt would exceed gpt2's context once outputs are added, so this example is analytical.)
 
 ### Task 4.2 — Output-length heterogeneity (20, 25, 200, 30)
 
-_TODO (also covers TODO 3 in `part4_static_batching.py`): explain why the batch runs to max_output, quantify the wasted slot-steps, and describe what changes if requests could leave the batch as soon as they finish._
+In naive static batching the batch is the unit of work: it leaves the GPU only when **every** member has finished. A batch with output lengths 20, 25, 200 and 30 therefore runs **200 decode steps**, and every step still computes all 4 rows. Hugging Face `generate()` keeps producing pad tokens for finished rows.
+
+| Decode steps | Rows doing useful work | Utilization of the 4 slots |
+|---|---:|---:|
+| 1–20 | 4 | 100% |
+| 21–25 | 3 | 75% |
+| 26–30 | 2 | 50% |
+| 31–200 | **1** | **25%** |
+
+Useful work is 20 + 25 + 200 + 30 = 275 token-steps out of 4 × 200 = 800 computed. That is **34.4% efficiency, so 65.6% of decode work is wasted**, and for 85% of the batch's lifetime (steps 31–200) three of the four slots compute nothing useful.
+
+The hardware utilization lost (also TODO 3 in `part4_static_batching.py`):
+- **Compute and memory bandwidth** spent on rows that are already done: their weights are read and multiplied for every step, and they consume slots that could serve other requests.
+- **KV-cache memory** held by finished requests until the batch ends, which reduces how many requests can fit (Part 2).
+- **Latency for short requests.** The 20-token request cannot be returned until step 200, so it waits 10× longer than it needs to.
+- **Head-of-line blocking.** Waiting requests cannot start until the whole batch finishes, which adds to queueing delay and TTFT.
+
+We measured this directly. Output efficiency was **0.466 at batch 4 and 0.370 at batches 8 and 16**, meaning 53–63% of all decode work was spent on tokens nobody asked for.
+
+**If requests could leave the batch immediately after completing:**
+- each finished request's result would be returned at once, and its slot and KV memory freed;
+- a waiting request could take the freed slot at the next step, so the batch would stay full of useful work instead of decaying to one active row;
+- short requests would see latency proportional to their own length, not the longest request's;
+- decode throughput would rise by up to 1 / output efficiency, about 2.7× at batch 16 even without any other optimization.
+
+This iteration-level scheduling is **continuous batching**, which vLLM implements (Task 4.4).
 
 ### Task 4.3 — vLLM comparison
 
-_TODO: requests/s and output tokens/s for vLLM vs. static batching, with the vLLM settings used (dtype, max_tokens / per-request SamplingParams)._
+**vLLM configuration.**
 
-_TODO (TODO 4 in `part4_vllm_offline.py`): explain why a single `max_tokens` value does not reproduce heterogeneous output lengths, and how that affects the comparison._
+| Setting | Value |
+|---|---|
+| Engine | vLLM 0.32.0 (V1 engine), offline `LLM.generate()` with all 50 requests submitted at once |
+| Model / precision | gpt2, `dtype=float16`. vLLM's `auto` would otherwise downcast gpt2's FP32 checkpoint to **bfloat16**, so FP16 was set explicitly to match the Hugging Face runs |
+| Prompts | Exactly `prompt_length` random token IDs per request (`--exact-workload`) |
+| Outputs | One `SamplingParams` per request: `temperature=0`, `max_tokens=output_length`, `ignore_eos=True` |
+| Engine defaults (from log) | FlashAttention-2 backend; torch.compile + CUDA graphs captured for batch sizes 1–512; chunked prefill (`max_num_batched_tokens=8192`); prefix caching on; KV cache 72.24 GiB = 2,104,240 tokens |
+| Repetitions | 3, after a 4-request warm-up. Each repetition uses **fresh random prompts**, so the prefix cache cannot reuse the previous repetition's prompts |
+| Environment fix | vLLM's FlashInfer sampling kernel is compiled at startup and needs `nvcc`. We loaded Sol's CUDA module and installed `ninja`. This affects only token sampling, which is identical under greedy decoding |
+
+vLLM reported **4,592 output tokens and 11,040 prompt tokens** in every repetition, exactly the workload's totals, so it did the same work as static batching.
+
+| System | Time for 50 requests (s) | **Requests/s** | **Output tokens/s** | vLLM speedup (tokens/s) |
+|---|---:|---:|---:|---:|
+| Static, *B* = 1 | 28.50 | 1.75 | 161 | 72× |
+| Static, *B* = 4 | 17.51 | 2.86 | 262 | 44× |
+| Static, *B* = 8 | 11.41 | 4.38 | 403 | 29× |
+| Static, *B* = 16 | 5.97 | 8.37 | 769 | 15.1× |
+| **vLLM** | **0.394 ± 0.001** | **126.8 ± 0.3** | **11,642 ± 26** | — |
+
+**Latency.** The offline API gives no per-request timestamps, so we cannot report vLLM's TTFT, TPOT or P95 here. However, all 50 requests finished within **0.394 s** of submission, which bounds every request's completion time. The best static configuration (*B* = 16) had a mean completion time of 3.77 s and a P95 of 5.52 s, so even vLLM's slowest request finished **14× sooner** than the static P95. Measuring TTFT/TPOT under real Poisson arrivals would require the online server and an async client, which we did not run.
+
+**Where the 15× gap over the best static configuration comes from.**
+1. **No wasted work.**
+   - Static *B* = 16 processed 25,600 prompt positions and 12,416 decode slots to deliver 11,040 useful prompt tokens and 4,592 useful output tokens.
+   - vLLM processes only the useful tokens. Prompts are packed into one flat token batch without padding, and finished requests leave immediately.
+2. **Larger effective batch.** All 50 requests run concurrently, versus 16. Part 3 showed throughput rising almost linearly with batch size in this range.
+3. **Much lower per-step overhead.**
+   - The longest request needs 256 decode iterations, so vLLM's 0.394 s implies **≤ 1.54 ms per iteration** with up to 50 sequences.
+   - Hugging Face needed about 5.5 ms per step at batch 1 (Part 1) and about 7.0 ms per step for static *B* = 16 here.
+   - CUDA graphs and compiled, fused kernels remove most of the Python and launch overhead that dominated Parts 1–3.
+
+**Why a single `max_tokens` does not reproduce heterogeneous output lengths (TODO 4 in `part4_vllm_offline.py`).** The starter script gave every request `SamplingParams(max_tokens=64)` and prompts of `"hello " * n`.
+- **Every request generates exactly 64 tokens** (3,200 in total) instead of the workload's 16–256 (4,592 in total). The amount of decode work is wrong, short requests run longer than they should, and long ones are cut off.
+- **Output-length heterogeneity disappears.** That heterogeneity is exactly what makes static batching waste work and what continuous batching exploits, so removing it changes what is being compared. The longest request needs 64 decode iterations instead of 256.
+- **Without `ignore_eos`, a request may stop early** if it generates EOS, so even `max_tokens` is only an upper bound.
+- **Prompt lengths are only approximate.** `"hello " * n` tokenizes to *n* + 1 tokens: 11,090 instead of 11,040.
+- **Every prompt shares the same prefix** (`hello hello …`). With prefix caching on, vLLM can reuse cached KV blocks across requests and skip much of the prefill, which the real workload would not allow.
+
+We ran the starter configuration as well (`--no-exact-workload`):
+
+| vLLM configuration | Output tokens | Prompt tokens | Time (s) | Requests/s | Output tokens/s |
+|---|---:|---:|---:|---:|---:|
+| Starter: single `max_tokens=64`, `"hello "` prompts | 3,200 | 11,090 | 0.162 | 308.6 | 19,749 |
+| Exact workload (used above) | 4,592 | 11,040 | 0.394 | 126.8 | 11,642 |
+
+The starter setting reports **2.4× more requests/s** for a different, easier workload. Comparing it with static batching (which honours each request's output length) would overstate vLLM's advantage, so the comparison above uses per-request `max_tokens` with `ignore_eos=True` and exact-length token prompts.
+
+### Part 4 plots
+
+![Static batching vs vLLM: output throughput](plots/part4_throughput.png)
+
+![Static batching vs vLLM: request throughput](plots/part4_requests.png)
+
+![Static batching vs vLLM: time to finish all 50 requests](plots/part4_total_time.png)
+
+![Static batching efficiency](plots/part4_efficiency.png)
+
+![Static batching completion time vs vLLM](plots/part4_completion.png)
 
 ### Task 4.4 — Systems mechanisms
 
-#### Mechanism 1: _TODO_
-- **Problem addressed:** _TODO_
-- **How it works:** _TODO_
-- **Connection to measurements:** _TODO_
+#### Mechanism 1: Continuous batching (iteration-level scheduling)
+- **Problem addressed:** Static batching fixes batch membership until the longest request finishes. Shorter prompts are padded, finished rows keep consuming slots, short requests wait for long ones, and new requests wait for the whole batch (Tasks 4.1 and 4.2).
+- **How it works:**
+  - The scheduler makes a decision **every iteration** (one model step) rather than every batch.
+  - After each step, finished sequences are removed and returned immediately. Waiting requests are admitted as soon as KV memory and the per-step token budget allow.
+  - The tokens of all running sequences are concatenated into one flat batch with no padding, and per-sequence lengths are passed to a variable-length attention kernel.
+  - vLLM also mixes new requests' prefill with ongoing decodes in the same iteration (chunked prefill, `max_num_batched_tokens=8192` in our log), so a long prompt does not stall everyone else's decoding.
+- **Connection to measurements:**
+  - Static *B* = 16 achieved only 43% prompt and 37% decode efficiency. vLLM's reported token counts equal the workload's useful tokens exactly, so it wasted nothing.
+  - Even with every request ready at t = 0, static batching's P95 completion time was 5.52 s, against 0.394 s for vLLM to finish all 50.
+  - Continuous batching alone would recover the up to 2.7× decode waste measured in Task 4.2.
 
-#### Mechanism 2: _TODO_
-- **Problem addressed:** _TODO_
-- **How it works:** _TODO_
-- **Connection to measurements:** _TODO_
+#### Mechanism 2: Paged KV-cache management (PagedAttention)
+- **Problem addressed:**
+  - With contiguous per-request KV buffers, a server must reserve space for each request's *maximum* possible length, because output length is unknown in advance. Most of that space is never used, and buffers of different sizes fragment GPU memory.
+  - Part 2 showed that the KV budget is what limits concurrency. We also saw PyTorch's allocator reserve all 80 GB for only a few GB of live, growing tensors.
+- **How it works:**
+  - At startup vLLM allocates the KV cache once, as a pool of fixed-size **blocks** (a few tokens each).
+  - Each sequence has a **block table** mapping its logical token positions to physical blocks, like virtual-memory pages. Blocks are allocated only as the sequence grows and are returned to the pool when it finishes.
+  - The attention kernel reads K/V through the block table, so a sequence's blocks need not be contiguous. Waste is limited to the last, partly filled block of each sequence.
+  - Blocks can be shared between sequences with a common prefix, which is the basis of **prefix caching**.
+- **Connection to measurements:**
+  - vLLM's startup log reported **72.24 GiB available for KV cache = 2,104,240 tokens**, i.e. 72.24 GiB ÷ 2,104,240 = **36.0 KiB per token**. That is exactly the gpt2 value from our Part 2 formula (2 × 12 × 12 × 64 × 2 B).
+  - It also reported a maximum concurrency of **2,055 requests of 1,024 tokens**. Our entire workload (≤ 15,632 tokens) used under 1% of the pool, so all 50 requests could run concurrently.
+  - The prefix-caching effect is visible in the starter configuration, whose shared `"hello …"` prompts let requests reuse cached blocks.
+
+#### Mechanism 3: Optimized kernels and CUDA graphs
+- **Problem addressed:** In Parts 1–3, Hugging Face's eager execution spent about 5.5 ms per decode step on Python dispatch and hundreds of small kernel launches, while the GPU's actual work was far smaller.
+- **How it works:**
+  - vLLM compiles the model with `torch.compile`, which fuses elementwise operations into fewer kernels.
+  - It **captures CUDA graphs** of the whole decode step for batch sizes 1–512 (`Capturing CUDA graphs … 51/51` in the log). Each later step then replays the recorded graph with a single launch, with no per-kernel CPU overhead.
+  - Attention uses FlashAttention-2's variable-length kernels, which handle ragged batches without padding and read K/V directly from paged blocks.
+- **Connection to measurements:**
+  - The 256-iteration workload finished in 0.394 s, **≤ 1.54 ms per iteration** for up to 50 sequences.
+  - Hugging Face took about 5.5 ms per step at batch 1 (Part 1) and about 7.0 ms at static batch 16, so vLLM's per-step cost is at least 3.6–4.5× lower.
+  - For a model as small as gpt2, this overhead reduction is a large part of vLLM's 15× advantage. For larger models, where GPU work dominates, continuous batching and paged memory would account for more of the gain.
 
 ---
 

@@ -1,0 +1,2 @@
+num_requests,total_time_sec,requests_per_sec,output_tokens_per_sec,output_tokens,prompt_tokens
+0.0,0.0008730728613969512,0.28039311286808977,25.751303485805284,0.0,0.0
