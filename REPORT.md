@@ -29,6 +29,8 @@ All experiments were run interactively on a single GPU node of the ASU Sol clust
 
 At the time the environment was recorded, `nvidia-smi` showed 0 MiB in use and no running processes, so no other jobs were sharing the GPU.
 
+Interactive sessions on Sol were allocated to different compute nodes (Part 1 on `sg029`, Part 2 on `sg046`). Every node used had the same GPU model (A100-SXM4-80GB), driver and software stack, and each comparison within a part was run in a single session on a single GPU.
+
 ### 0.2 Model and numerical precision
 
 | Setting | Value |
@@ -227,33 +229,176 @@ For a larger model, long contexts, or large batches, the KV read per step become
 
 ### Implementation (Task 2.1)
 
-_TODO: briefly describe the three steps of `generate_without_cache()` and the agreement-check result (PASS, or the divergence position and the fp16 explanation)._
+`generate_without_cache()` repeats three steps for each output token:
+
+1. Run the model over the **entire** current sequence (prompt plus every token generated so far) with `use_cache=False`, so no keys or values are reused from earlier steps.
+2. Take the logits at the last position and choose the next token greedily with `argmax(..., keepdim=True)`, which keeps the shape `[batch, 1]`.
+3. Append that token to the sequence with `torch.cat(..., dim=1)`.
+
+**Agreement check.**
+- At batch size 1, cached and uncached generation produced **identical tokens** at every output length (match rate 1.0).
+- At batch size 32, **exactly 2 generated tokens differ** at every output length, out of 32 × *m* (up to 28,672), the first at generated position 2 (match rate ≥ 0.998).
+  - The cause is FP16 rounding, not a logic error. The cached path multiplies one new token against stored K/V, while the uncached path recomputes the full sequence. The two use different kernels and summation orders, so a near-tie between two candidate tokens can flip.
+  - With greedy decoding on random prompts, gpt2 falls quickly into a repetitive pattern, so the affected row rejoins the same token sequence after the flip.
+
+**Two fixes were needed to run batched experiments.**
+1. **`agreement_check()` crash.** As provided, it looked for the first mismatch only in row 0, so it raised `IndexError` when row 0 matched but another row diverged. It now reports the earliest mismatching position across all rows in that case.
+2. **Allocator fragmentation.** At batch 32 without the cache, every step allocates slightly larger tensors than the step before. PyTorch's caching allocator kept reserving new blocks until all 80 GB was reserved for only a few GB of live data. It then hit OOM, flushed its cache and retried, which added time to the measurements. Both batch sizes were therefore run with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ### Experimental parameters
 
 | Parameter | Value |
 |---|---|
-| Prompt length | 128 |
-| Output lengths | _TODO_ |
-| Script | `python part2_kv_cache.py` |
-| Output | `part2_kv_cache.csv` |
+| Prompt length | 128 (random tokens, fixed seed) |
+| Output lengths | 32, 128, 256, 512, 896 (128 + 896 = 1024, gpt2's maximum) |
+| Batch sizes | 1 and 32 (separate runs) |
+| Repetitions | 3 per configuration, after one warm-up of each method |
+| Precision | FP16 |
+| Allocator | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
+| Command | `python part2_kv_cache.py --batch-size {1,32} --out results/part2_kv_cache_b{1,32}.csv` |
+| Output | `results/part2_kv_cache_b{1,32}.csv` (raw), `_mean.csv`, `_std.csv` |
+
+**Metric definitions.**
+- **Latency** is the whole generation call: prefill plus all decode steps.
+- **ms per step** is latency ÷ `output_length`. At batch 32 each step produces 32 tokens, one per sequence.
+- **Peak memory** is `torch.cuda.max_memory_allocated()` and includes the 0.232 GiB of FP16 weights.
 
 ### Results (Task 2.2)
 
-_TODO: table of latency_sec, ms_per_token, peak_memory_gb for use_cache ∈ {True, False} × output length._
+**Batch size 1** (mean ± std over 3 runs)
 
-_TODO: insert plot(s)._
+| Output | Cache | Latency (s) | ms per step | Peak memory (GiB) | Match rate |
+|---:|:---:|---:|---:|---:|---:|
+| 32 | on | 0.178 ± 0.001 | 5.56 ± 0.03 | 0.256 | 1.00000 |
+| 32 | off | 0.177 ± 0.002 | 5.53 ± 0.05 | 0.270 | 1.00000 |
+| 128 | on | 0.709 ± 0.002 | 5.54 ± 0.02 | 0.256 | 1.00000 |
+| 128 | off | 0.703 ± 0.001 | 5.49 ± 0.01 | 0.288 | 1.00000 |
+| 256 | on | 1.443 ± 0.006 | 5.64 ± 0.02 | 0.256 | 1.00000 |
+| 256 | off | 1.422 ± 0.014 | 5.56 ± 0.06 | 0.312 | 1.00000 |
+| 512 | on | 2.854 ± 0.004 | 5.57 ± 0.01 | 0.263 | 1.00000 |
+| 512 | off | 2.917 ± 0.015 | 5.70 ± 0.03 | 0.360 | 1.00000 |
+| 896 | on | 5.024 ± 0.016 | 5.61 ± 0.02 | 0.277 | 1.00000 |
+| 896 | off | 5.308 ± 0.021 | 5.92 ± 0.02 | 0.433 | 1.00000 |
+
+**Batch size 32** (mean ± std over 3 runs)
+
+| Output | Cache | Latency (s) | ms per step | Peak memory (GiB) | Match rate |
+|---:|:---:|---:|---:|---:|---:|
+| 32 | on | 0.188 ± 0.000 | 5.89 ± 0.00 | 0.771 | 0.99805 |
+| 32 | off | 0.472 ± 0.006 | 14.76 ± 0.18 | 1.197 | 0.99805 |
+| 128 | on | 0.745 ± 0.004 | 5.82 ± 0.03 | 0.771 | 0.99951 |
+| 128 | off | 2.443 ± 0.014 | 19.09 ± 0.11 | 1.776 | 0.99951 |
+| 256 | on | 1.488 ± 0.007 | 5.81 ± 0.03 | 0.771 | 0.99976 |
+| 256 | off | 6.434 ± 0.017 | 25.13 ± 0.07 | 2.549 | 0.99976 |
+| 512 | on | 2.963 ± 0.010 | 5.79 ± 0.02 | 0.975 | 0.99988 |
+| 512 | off | 19.045 ± 0.004 | 37.20 ± 0.01 | 4.095 | 0.99988 |
+| 896 | on | 5.400 ± 0.006 | 6.03 ± 0.01 | 1.415 | 0.99993 |
+| 896 | off | 49.702 ± 0.017 | 55.47 ± 0.02 | 6.413 | 0.99993 |
+
+**Slowdown from disabling the cache** (latency without cache ÷ latency with cache):
+
+| Output length | 32 | 128 | 256 | 512 | 896 |
+|---|---:|---:|---:|---:|---:|
+| Batch 1 | 0.99× | 0.99× | 0.99× | 1.02× | 1.06× |
+| Batch 32 | 2.5× | 3.3× | 4.3× | 6.4× | **9.2×** |
+
+**Key observations.**
+- **Batch 32 without the cache grows quadratically.** Total latency fits *a·m + b·m²* with **R² = 0.9999995**, while a straight line fits with R² = 0.962. Dividing latency by the number of token positions the model actually processes (32 × Σₜ (128 + *t*)) gives a nearly constant **3.0–3.2 µs per token** at every output length. The extra time is accounted for entirely by recomputation.
+- **With the cache, cost per step is flat** at 5.8–6.0 ms (batch 32) and 5.5–5.6 ms (batch 1), regardless of length.
+- **At batch 1 the two methods are indistinguishable** until 896 tokens (1.06×). As in Part 1, a single-sequence forward pass is dominated by a fixed ~5.5 ms of Python and kernel-launch overhead, which hides the recomputation.
+
+![Batch 32: latency, cache on vs off](plots/part2_latency_b32.png)
+
+![Batch 32: time per decode step, cache on vs off](plots/part2_ms_per_token_b32.png)
+
+![Batch 32: peak memory, cache on vs off](plots/part2_memory_b32.png)
+
+![Batch 1: latency, cache on vs off](plots/part2_latency_b1.png)
+
+![Batch 1: time per decode step, cache on vs off](plots/part2_ms_per_token_b1.png)
+
+![Batch 1: peak memory, cache on vs off](plots/part2_memory_b1.png)
 
 ### KV-cache memory derivation (Task 2.3)
 
-_TODO: derive the formula from the per-layer K and V tensor shapes, explain the factor of 2, and show the `part2_kv_size.py` check for gpt2 (layers=12, kv-heads=12, head-dim=64, bytes=2) and at least one other configuration._
+**Derivation.** In each attention layer, every token's hidden state is projected to a key vector and a value vector for each of the *H_kv* KV heads, each of dimension *D*. For *B* sequences of cached length *S*, one layer therefore stores:
+
+- a key tensor of shape [*B*, *H_kv*, *S*, *D*], i.e. *B·H_kv·S·D* elements;
+- a value tensor of the same shape, another *B·H_kv·S·D* elements.
+
+Summing over *L* layers and multiplying by *b* bytes per element:
+
+$$
+\text{KV bytes} \;=\; 2 \cdot B \cdot L \cdot S \cdot H_{kv} \cdot D \cdot b
+$$
+
+**The factor of 2** is there because attention needs both keys and values of every earlier token, and they are separate tensors with identical shapes. Keys are compared with the current query to produce attention weights, and values are the vectors those weights average. Queries are *not* cached: each token's query is used only at the step that produced it.
+
+With grouped-query attention, *H_kv* is smaller than the number of query heads, which shrinks the cache proportionally. gpt2 uses standard multi-head attention, so *H_kv* = 12.
+
+**Per-token cost:**
+- gpt2: 2 × 12 × 12 × 64 × 2 B = 36,864 B = **36 KiB per token per sequence**.
+- Llama-8B-style configuration: 2 × 32 × 8 × 128 × 2 B = 131,072 B = **128 KiB per token**.
+
+**Checks with `part2_kv_size.py`:**
+
+| Configuration | Command | Result |
+|---|---|---|
+| gpt2, *B* = 1, *S* = 1024 | `python part2_kv_size.py --layers 12 --kv-heads 12 --head-dim 64 --seq-len 1024` | 37,748,736 B = **36.00 MiB** |
+| gpt2, *B* = 32, *S* = 1024 | `... --batch-size 32` | 1,207,959,552 B = **1.125 GiB** |
+| Llama-8B-style (*L* = 32, *H_kv* = 8, *D* = 128, *S* = 4096), *B* = 1 | `python part2_kv_size.py` (defaults) | 536,870,912 B = **512 MiB** |
+
+**Agreement with measured memory.** At batch 32 with 896 output tokens, the cached sequence reaches 1024 tokens. The formula predicts 1.125 GiB of KV cache. Measured peak memory was 1.415 GiB, or 1.183 GiB after subtracting the 0.232 GiB of weights. That is within about 5% of the prediction; the small remainder is temporaries such as the copy made when each layer's cache grows by concatenation.
+
+The cached memory curve is also explained by the formula. Up to 256 output tokens, peak memory stays at 0.771 GiB because the peak is set by **prefill**: the prompt's logits (32 × 128 × 50,257 × 2 B = 0.38 GiB) plus the weights and the 128-token cache (0.14 GiB). Those logits are freed after the first step. The cache grows by 32 × 36 KiB = 1.125 MiB per generated token, so it needs about 350 more tokens (roughly 480 in total) to exceed that earlier peak. After that point, memory rises in proportion to *S*.
 
 ### Analysis (Task 2.4)
 
-1. **Why does caching reduce redundant computation?** _TODO_
-2. **Why does cache memory grow with sequence length?** _TODO_
-3. **Why does long-context serving reduce concurrency?** _TODO_
-4. **Why can a serving system become memory-limited even when compute is available?** _TODO_
+**1. Why does caching reduce redundant computation?**
+
+In a causal Transformer, the key and value of token *i* depend only on tokens 1…*i*. Once computed, they never change, no matter how many tokens follow.
+
+Without a cache, every decode step recomputes K and V (and the full layer stack) for every earlier token. Generating *m* tokens after an *n*-token prompt therefore processes Σₜ (*n* + *t*) ≈ *nm* + *m*²/2 token positions instead of *n* + *m*. For *n* = 128 and *m* = 896, that is **515,648 positions per sequence versus 1,024**, about 500× more work. With a cache, each step processes only the newest token and reads the stored K/V of the rest.
+
+Our measurements confirm this. At batch 32:
+- no-cache latency grows quadratically (R² = 0.9999995) and costs a constant ~3 µs per processed token position;
+- cached latency grows linearly at about 5.9 ms per step;
+- disabling the cache is **9.2× slower at 896 tokens**, and the gap widens with length.
+
+The measured slowdown is far below 500× for two reasons. Recomputation is done in large, efficient prefill-style passes, and every cached step still pays the fixed ~5.5 ms per-forward overhead. At batch 1 that overhead hides the redundant work almost completely (0.99–1.06×). The recomputation is still happening, but it is cheap relative to the per-step overhead until the batch and sequence are large.
+
+**2. Why does cache memory grow with sequence length?**
+
+The cache must keep K and V for *every* token the model may still attend to. Each new token adds one key and one value per layer per KV head, so cache size is linear in *S*: 2·*L*·*H_kv*·*D*·*b* bytes per token (36 KiB for gpt2) for each sequence.
+
+We observed this directly. At batch 32, cached peak memory rose from 0.77 to 1.41 GiB as the sequence grew to 1024 tokens, within about 5% of the 1.125 GiB the formula predicts. Memory without the cache grew even faster (1.20 → 6.41 GiB), because each step re-creates logits for every position (3.06 GiB at 1023 tokens). Here the cache saves memory as well as time.
+
+**3. Why does long-context serving reduce concurrency?**
+
+GPU memory is fixed. After the weights (and activation workspace), the remainder is a budget for KV caches, and each active request needs 2·*L*·*H_kv*·*D*·*b*·*S* bytes. The maximum number of concurrent requests is therefore roughly:
+
+> KV budget ÷ (bytes per token × context length)
+
+so it falls in **inverse proportion to context length**.
+
+For the Llama-8B-style configuration on our 80 GB A100:
+- the weights take about 16 GB, leaving roughly 60 GB for KV;
+- each 4096-token request needs 512 MiB, allowing about **110 concurrent requests**;
+- at 32k tokens each request needs 4 GiB, allowing about **14**.
+
+Even gpt2's tiny cache reaches 1.125 GiB for 32 sequences of 1024 tokens. Fewer concurrent requests means smaller decode batches, which (Part 3) means lower throughput.
+
+**4. Why can a serving system become memory-limited even when compute is available?**
+
+Decode does very little arithmetic per step. It is limited by overhead and memory bandwidth, not FLOPs (Part 1). Batching is how a serving system raises GPU utilization, and our data shows how cheap extra sequences are in compute terms: a cached decode step at **batch 32 took 5.89 ms versus 5.56 ms at batch 1, 32× the tokens for 6% more time**. In principle the server could keep adding requests to the batch.
+
+Every additional request, however, brings its own KV cache, which grows as the request generates. The batch can only grow until the KV caches fill the memory budget. Past that point the system must queue or reject new requests, or evict existing ones, even though the Tensor Cores are mostly idle. Memory capacity, not compute, sets the limit.
+
+This gets worse when memory is wasted:
+- reserving each request's maximum possible context up front;
+- fragmentation from caches of different, growing sizes.
+
+We saw an extreme case of fragmentation in the no-cache batch-32 run. PyTorch's allocator had reserved all 80 GB while only a few GB were in use, and it hit OOM. Mechanisms such as paged KV-cache management (Part 4) exist to reduce exactly this waste.
 
 ---
 

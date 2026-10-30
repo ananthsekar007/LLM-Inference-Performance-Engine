@@ -111,6 +111,25 @@ def plot_part2(path):
     plt.savefig("part2_kv_latency.pdf", bbox_inches="tight")
     plt.close()
 
+    batch_size = int(df["batch_size"].iloc[0]) if "batch_size" in df else 1
+    metrics = [
+        ("latency_sec", "Generation Latency (s)", "latency"),
+        ("ms_per_token", "Time per Decode Step (ms)", "ms_per_token"),
+        ("peak_memory_gb", "Peak GPU Memory (GB)", "memory"),
+    ]
+
+    for column, ylabel, name in metrics:
+        plot_lines(
+            df,
+            x="output_length",
+            y=column,
+            group="use_cache",
+            xlabel="Output Length (tokens)",
+            ylabel=ylabel,
+            title=f"KV Cache On vs Off: {ylabel} (batch={batch_size})",
+            filename=f"part2_{name}_b{batch_size}",
+        )
+
 
 def plot_part3(path):
     df = pd.read_csv(path)
