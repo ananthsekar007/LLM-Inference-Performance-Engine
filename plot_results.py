@@ -153,6 +153,58 @@ def plot_part3(path):
         plt.savefig(filename, bbox_inches="tight")
         plt.close()
 
+    log_metrics = [
+        ("tokens_per_sec", "Output Tokens / second", "part3_throughput"),
+        ("requests_per_sec", "Requests / second", "part3_requests"),
+        ("latency_sec", "End-to-End Latency (s)", "part3_latency"),
+        ("ttft_ms", "TTFT Approximation (ms)", "part3_ttft"),
+        ("tpot_ms", "TPOT (ms/token)", "part3_tpot"),
+        ("peak_memory_gb", "Peak GPU Memory (GB)", "part3_memory"),
+    ]
+
+    for column, ylabel, filename in log_metrics:
+        plt.figure()
+        plt.plot(
+            df["batch_size"],
+            df[column],
+            marker="o",
+        )
+        plt.xscale("log", base=2)
+        plt.xticks(df["batch_size"], [str(b) for b in df["batch_size"]])
+        plt.ylim(bottom=0)
+        plt.grid(alpha=0.3)
+        plt.xlabel("Batch Size (log scale)")
+        plt.ylabel(ylabel)
+        plt.title(f"Batch Size vs {ylabel}")
+        plt.savefig(f"{filename}.pdf", bbox_inches="tight")
+        plt.savefig(f"{filename}.png", dpi=150, bbox_inches="tight")
+        plt.close()
+
+    plt.figure()
+    plt.plot(
+        df["latency_sec"],
+        df["tokens_per_sec"],
+        marker="o",
+    )
+    for _, row in df.iterrows():
+        if row["batch_size"] in (2, 4, 8):
+            continue
+        plt.annotate(
+            f"b={int(row['batch_size'])}",
+            (row["latency_sec"], row["tokens_per_sec"]),
+            textcoords="offset points",
+            xytext=(6, -10),
+            fontsize=8,
+        )
+    plt.ylim(bottom=0)
+    plt.grid(alpha=0.3)
+    plt.xlabel("End-to-End Latency (s)")
+    plt.ylabel("Output Tokens / second")
+    plt.title("Throughput vs Latency Tradeoff")
+    plt.savefig("part3_tradeoff.pdf", bbox_inches="tight")
+    plt.savefig("part3_tradeoff.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
 
 def main():
     parser = argparse.ArgumentParser()

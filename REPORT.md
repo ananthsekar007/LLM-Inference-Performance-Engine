@@ -414,27 +414,121 @@ We saw an extreme case of fragmentation in the no-cache batch-32 run. PyTorch's 
 
 | Parameter | Value |
 |---|---|
-| Batch sizes | _TODO_ |
-| Prompt length | 128 |
-| Output length | _TODO_ |
-| Script | `python part3_batching.py` |
-| Output | `part3_batching.csv` |
+| Batch sizes | 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 |
+| Prompt length | 128 (random tokens; identical length for every request) |
+| Output length | 128 |
+| Repetitions | 3 per batch size, after one warm-up (batch 1, prompt 32, output 4) |
+| Precision | FP16 |
+| Allocator | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` |
+| Command | `python part3_batching.py --out results/part3_batching.csv` |
+| Output | `results/part3_batching.csv` (raw), `_mean.csv`, `_std.csv` |
+
+The starter script stopped at batch 16. We extended it to 512 because, at 16, throughput was still rising in proportion to batch size, so the point of diminishing returns (Q3) would not have been visible. Batch 512 used 11.1 GiB, so the run never hit the script's out-of-memory guard.
 
 ### Metric definitions (TODO 2 in the starter code)
 
-_TODO: state and justify each formula: `requests_per_sec`, `tokens_per_sec`, `tpot_ms`, and why `ttft_ms` (prefill time) is only an approximation of TTFT._
+All *B* requests in a batch start together, have the same prompt and output lengths, and therefore finish together. Each formula relies on that.
 
-### Results
+| Metric | Formula | Meaning and caveats |
+|---|---|---|
+| `ttft_ms` | prefill time × 1000 | Time for one forward pass over all *B* × 128 prompt tokens, which produces every request's first token. It is only an **approximation** of TTFT. A real TTFT is measured from when a request *arrives* until its first token reaches the user, so it also includes time queued waiting for a batch, scheduling, tokenization and network delay. None of those exist here, because every request is ready at time 0. |
+| `tpot_ms` | decode time × 1000 ÷ `output_length` | Average time per decode step. Each step produces one token for *every* request in the batch, so this is also the inter-token latency each individual user sees. |
+| `latency_sec` | prefill + decode | End-to-end latency of every request, since they all start and finish together. |
+| `requests_per_sec` | *B* ÷ `latency_sec` | Correct only because the whole batch finishes at once. With mixed output lengths, requests would finish at different times and the batch would be held until the longest one finished (Part 4). |
+| `tokens_per_sec` | *B* × `output_length` ÷ `latency_sec` | Aggregate output throughput. Prompt tokens are not counted, but prefill time *is* in the denominator, as a user would experience. Prefill also produces one token per request before the `output_length` decode steps, so each request actually generates `output_length` + 1 tokens. The formula therefore undercounts by 1/129 (< 1%). |
+| `peak_memory_gb` | `torch.cuda.max_memory_allocated()` | Includes the 0.232 GiB of weights. The prefill `outputs` (full prompt logits) stay referenced during decode in this script, so they are part of the peak. |
 
-_TODO: results table and the three plots._
+### Task 3.1 — Results (mean ± std over 3 runs)
+
+| Batch | TTFT approx. (ms) | TPOT (ms) | Latency (s) | Requests/s | Output tokens/s | Peak memory (GiB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 7.7 ± 1.0 | 5.49 ± 0.03 | 0.711 ± 0.003 | 1.4 | 180 ± 1 | 0.261 |
+| 2 | 7.6 ± 0.2 | 6.03 ± 0.72 | 0.779 ± 0.092 | 2.6 | 331 ± 37 | 0.282 |
+| 4 | 8.8 ± 0.1 | 5.56 ± 0.00 | 0.721 ± 0.001 | 5.6 | 711 ± 1 | 0.325 |
+| 8 | 11.6 ± 2.9 | 5.54 ± 0.01 | 0.721 ± 0.004 | 11.1 | 1,420 ± 8 | 0.410 |
+| 16 | 15.6 ± 2.8 | 5.51 ± 0.03 | 0.721 ± 0.006 | 22.2 | 2,840 ± 25 | 0.580 |
+| 32 | 15.3 ± 0.2 | 5.78 ± 0.03 | 0.755 ± 0.003 | 42.4 | 5,425 ± 25 | 0.919 |
+| 64 | 28.5 ± 0.7 | 5.81 ± 0.03 | 0.772 ± 0.004 | 82.9 | 10,612 ± 55 | 1.599 |
+| 128 | 56.4 ± 4.4 | 6.44 ± 0.02 | 0.881 ± 0.007 | 145.2 | 18,590 ± 139 | 2.958 |
+| 256 | 104.1 ± 0.1 | 11.41 ± 0.00 | 1.565 ± 0.001 | 163.6 | 20,941 ± 8 | 5.677 |
+| 512 | 205.5 ± 0.0 | 21.57 ± 0.01 | 2.966 ± 0.001 | 172.6 | 22,092 ± 6 | 11.114 |
+
+The larger standard deviations at batch 2 (TPOT) and at batches 8–16 (TTFT) come from the first repetition at each new batch shape, as in Part 1. At batch 2, rep 0 had a TPOT of 6.86 ms versus 5.63 and 5.59 ms for reps 1–2. Likewise, batch 16's TTFT is 14.1 ms without its first run, so the apparent dip at batch 32 is not a real effect.
+
+**Scaling summary.**
+
+| Batch | 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 256 | 512 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Throughput gain over the previous batch size | — | 1.84× | 2.14× | 2.00× | 2.00× | 1.91× | 1.96× | 1.75× | **1.13×** | **1.05×** |
+| Throughput ÷ (batch × batch-1 throughput) | 1.00 | 0.92 | 0.99 | 0.99 | 0.99 | 0.94 | 0.92 | 0.81 | 0.45 | 0.24 |
+
+- Peak memory grows linearly at about **21.7 MiB per additional sequence**. That matches 256 tokens × 36 KiB of KV cache (9 MiB) plus the 128 × 50,257 × 2 B prompt logits kept from prefill (12.3 MiB), a total of 21.3 MiB.
+- At batch 512, the prefill pass processes 65,536 tokens in 205 ms. That is about 320k tokens/s, or about 79 TFLOP/s for the linear layers alone.
+
+### Task 3.2 — Plots
+
+Batch size is shown on a log₂ axis so that every doubling is evenly spaced. The starter code's linear-axis versions are also in `plots/` (`batch_vs_throughput.pdf`, `batch_vs_latency.pdf`, `batch_vs_memory.pdf`).
+
+![Batch size vs throughput](plots/part3_throughput.png)
+
+![Batch size vs end-to-end latency](plots/part3_latency.png)
+
+![Batch size vs peak memory](plots/part3_memory.png)
+
+![Batch size vs TTFT](plots/part3_ttft.png)
+
+![Batch size vs TPOT](plots/part3_tpot.png)
+
+![Throughput vs latency tradeoff](plots/part3_tradeoff.png)
 
 ### Analysis
 
-1. **Why can larger batches improve GPU utilization?** _TODO_
-2. **Why does throughput not increase linearly forever?** _TODO_
-3. **Where do you observe diminishing returns?** _TODO_
-4. **Why can latency increase even when throughput improves?** _TODO_
-5. **For an interactive chatbot, would you choose the max-throughput batch size? Why or why not?** _TODO_
+**1. Why can larger batches improve GPU utilization?**
+
+A decode step has two kinds of cost:
+- a **fixed** cost paid once per step whatever the batch: reading all the weights from HBM, launching hundreds of kernels, and Python/Hugging Face dispatch;
+- a **per-sequence** cost: the arithmetic for that sequence's token and reading its own KV cache.
+
+At batch 1, the fixed cost is almost everything (Parts 1–2): each weight is loaded to do one multiply-add, and the Tensor Cores sit idle. Batching processes *B* sequences in the same step. Every weight read and every kernel launch is shared by *B* tokens, and each layer becomes a *B*-row matrix multiply instead of a matrix-vector product, so arithmetic intensity rises roughly in proportion to *B*.
+
+Our data shows this clearly. From batch 1 to batch 64, TPOT rose only from 5.49 to 5.81 ms, while each step produced 64× more tokens. Throughput went from **180 to 10,612 tokens/s, 59× for a 64× batch** (92% of perfectly linear scaling).
+
+**2. Why does throughput not increase linearly forever?**
+
+Linear scaling lasts only while the fixed cost dominates. The per-sequence cost grows with *B*. A sequence's K/V cannot be shared with other sequences, so the KV bytes read per step grow as *B* × context length. At batch 512, the cache is 2.25–4.5 GiB during decode, and it is read every step (and partly re-copied as Hugging Face's cache grows by concatenation). Matmul FLOPs also grow with *B*.
+
+Once that per-sequence work exceeds the fixed cost, step time grows with *B*. TPOT doubles each time the batch doubles beyond 128 (6.44 → 11.41 → 21.57 ms), so tokens per second stops growing. Decode converges to a constant cost of about **42 µs per token**, and throughput saturates at about **22k tokens/s**, whether the limit is memory bandwidth or compute.
+
+Prefill saturates even earlier. TTFT is flat at batches 1–2, then doubles with each doubling from 64 onward, because a 65,536-token prefill pass is fully compute-bound. Beyond these limits, memory capacity would eventually cap the batch outright: 21.7 MiB per sequence here, far more for a larger model or longer contexts (Part 2).
+
+**3. Where do you observe diminishing returns?**
+
+Between **batch 128 and batch 256**:
+- every doubling up to 64 gave 1.9–2.1× more throughput, and 64 → 128 still gave 1.75×;
+- **128 → 256 gave only 1.13×, and 256 → 512 only 1.05×**;
+- relative to perfectly linear scaling, efficiency falls from 0.92 at 64 to 0.81 at 128, then 0.45 at 256 and 0.24 at 512.
+
+The same knee shows in latency. TPOT first rises noticeably at 128 (6.44 ms), and end-to-end latency jumps from 0.88 s at 128 to 1.57 s at 256 and 2.97 s at 512. In the throughput-vs-latency plot, the curve turns from nearly vertical to nearly horizontal at batch 128.
+
+**4. Why can latency increase even when throughput improves?**
+
+Throughput is a **system-wide** rate: total tokens across all users ÷ time. Latency is what **each individual request** experiences. Batching raises the first by making each request share the GPU with more others, which can slow every one of them down:
+
+- **TTFT** — all *B* prompts are prefilled in one pass before anyone gets a first token. Once prefill is compute-bound, that pass takes time proportional to *B*: 7.7 ms at batch 1, 205 ms at 512.
+- **TPOT** — every decode step serves all *B* requests. Once the GPU is saturated, each step takes longer: 5.5 ms → 21.6 ms per token for every user.
+- **Batch-level waiting** — in a static batch, every request is tied to the others: it starts when the batch starts and finishes when the batch finishes. In a live system, requests must also wait in a queue for a batch to be formed.
+
+Between batch 128 and 512, throughput improved by only 19% (18,590 → 22,092 tokens/s), but every request's end-to-end latency grew **3.4×** (0.88 → 2.97 s). The system serves more tokens per second by making each user wait longer, which is consistent with Little's law (concurrency = throughput × latency).
+
+**5. For an interactive chatbot, would you choose the max-throughput batch size? Why or why not?**
+
+**No.** A chatbot user experiences TTFT (how long before text starts appearing) and TPOT (how fast it streams), not the aggregate tokens per second. The right choice is the **largest batch that still meets the latency targets, with headroom**, not the maximum-throughput point.
+
+In our measurements, batch 512 maximizes throughput, but the last two doublings buy only 19% more throughput for 3.6× worse TTFT, 3.4× worse TPOT and 3.4× worse end-to-end latency. **Batch 128** gets 84% of the maximum throughput while keeping TPOT at 6.4 ms and TTFT at 56 ms. **Batch 64** is the conservative choice: about half the peak throughput, but essentially no latency cost compared with batch 1.
+
+Running at the knee rather than at saturation also leaves headroom for real traffic. Arrivals are bursty, prompts are longer and varied (a long prompt in a large batch stalls everyone's decode), and queueing delay adds to TTFT. A server that is already saturated has no slack to absorb these, so tail latency grows quickly.
+
+For gpt2 even batch 512 streams faster than people read (about 46 tokens/s per user). For a production-size model, however, every one of these latencies would be one to two orders of magnitude larger, and the same knee would decide whether SLOs are met.
 
 ---
 
