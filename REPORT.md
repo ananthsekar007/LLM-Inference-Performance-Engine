@@ -51,7 +51,8 @@ At the time the environment was recorded, `nvidia-smi` showed 0 MiB in use and n
 - **Warm-up.** Every script runs a short warm-up (prompt 32, output 4) before any measurement. The first CUDA calls pay one-time costs: creating the CUDA context, loading kernels, cuBLAS/cuDNN heuristic and algorithm selection, and growing the caching allocator. Excluding the warm-up keeps those costs out of the reported numbers.
 - **Model loading excluded.** The model and tokenizer are loaded and moved to the GPU in `main()` before any timer starts. Download and load time is therefore never included in latency.
 - **Fixed model, precision and hardware.** Every comparison uses gpt2 in FP16 on the same A100-SXM4-80GB.
-- **Repetitions.** _TODO: describe the repetition policy as implemented (e.g., each configuration is run 3 times after warm-up and the mean ± standard deviation is reported; raw per-run rows are kept in the CSV)._
+- **Repetitions.** Each configuration is run 3 times, after a single warm-up at the start of the script. Tables report the mean ± standard deviation across the 3 runs. The raw per-run rows (with a `rep` column) are kept in `results/part1_prefill_decode.csv`, and the aggregates are in `*_mean.csv` and `*_std.csv`.
+- **First run at a new input shape.** In Part 1, the first repetition (rep 0) at a new prompt length was often slower than reps 1–2. At prompt 512 / output 32 it took 20.9 ms vs. 9.7 and 9.3 ms. The warm-up only exercised a 32-token prompt, so the first call at each new sequence length still pays one-time costs such as choosing a GEMM/attention kernel for that shape. Averaging three runs reduces the effect, and the standard-deviation columns make it visible.
 - **Synthetic inputs.** Prompts are random token IDs (`utils.synthetic_tokens`) with a fixed seed (`seed_everything(42)`). Content does not affect compute cost for a fixed sequence length, and fixed seeds make runs reproducible.
 - **Memory metric.** Peak memory is `torch.cuda.max_memory_allocated()`, reset before each measured case. It counts tensors allocated by PyTorch, including the model weights. It is lower than the usage `nvidia-smi` shows, because `nvidia-smi` also counts the CUDA context and memory held in PyTorch's caching allocator but not currently allocated.
 
@@ -100,23 +101,118 @@ Without synchronization, the measured time is about 54× too small. It captures 
 | Prompt lengths | 128, 256, 512, 768 |
 | Output lengths | 32, 64, 128, 256 |
 | Batch size | 1 |
-| Script | `python part1_prefill_decode.py` |
-| Output | `part1_prefill_decode.csv` |
+| Decoding | Greedy, manual loop with `past_key_values` (no `generate()`, no early EOS stop) |
+| Precision | FP16 |
+| Warm-up | 1 run (prompt 32, output 4) before measurement |
+| Repetitions | 3 per configuration (48 runs in total) |
+| Script | `python part1_prefill_decode.py --out results/part1_prefill_decode.csv` |
+| Output | `results/part1_prefill_decode.csv` (raw), `_mean.csv`, `_std.csv` |
 
-### Results
+**Metric definitions.**
+- **Prefill** is one forward pass over the full prompt, which also produces the first output token.
+- **Decode** is the loop of `output_length` single-token forward passes that reuse the KV cache.
+- **End-to-end** = prefill + decode.
+- **TPOT** = decode time / `output_length`, i.e. the mean time per decode step.
+- **Peak memory** is `torch.cuda.max_memory_allocated()` and includes the FP16 weights (124.4M params × 2 B ≈ 0.232 GiB).
 
-_TODO: table of mean prefill_ms, decode_ms, total_ms, tpot_ms, peak_memory_gb per (prompt, output) configuration._
+### Task 1.1 — Results (mean ± std over 3 runs)
 
-_TODO: insert plots (prefill vs prompt length, decode vs output length, TPOT vs output length)._
+| Prompt | Output | Prefill (ms) | Decode (ms) | End-to-end (ms) | TPOT (ms/token) | Peak memory (GiB) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 32 | 8.01 ± 1.01 | 177.1 ± 0.7 | 185.1 ± 0.8 | 5.534 ± 0.023 | 0.2635 |
+| 128 | 64 | 7.45 ± 0.03 | 357.5 ± 1.5 | 365.0 ± 1.5 | 5.586 ± 0.023 | 0.2647 |
+| 128 | 128 | 7.57 ± 0.12 | 717.4 ± 8.4 | 725.0 ± 8.5 | 5.605 ± 0.066 | 0.2670 |
+| 128 | 256 | 7.49 ± 0.02 | 1445.2 ± 10.4 | 1452.7 ± 10.4 | 5.645 ± 0.041 | 0.2715 |
+| 256 | 32 | 8.06 ± 0.71 | 183.7 ± 3.0 | 191.8 ± 3.7 | 5.741 ± 0.094 | 0.2801 |
+| 256 | 64 | 8.85 ± 2.18 | 363.8 ± 4.8 | 372.6 ± 3.0 | 5.684 ± 0.074 | 0.2812 |
+| 256 | 128 | 9.42 ± 3.21 | 724.3 ± 3.9 | 733.7 ± 0.9 | 5.659 ± 0.030 | 0.2835 |
+| 256 | 256 | 7.67 ± 0.06 | 1454.4 ± 10.3 | 1462.1 ± 10.2 | 5.681 ± 0.040 | 0.2881 |
+| 512 | 32 | 13.28 ± 6.61 | 180.0 ± 0.4 | 193.3 ± 6.3 | 5.625 ± 0.012 | 0.3141 |
+| 512 | 64 | 9.40 ± 0.15 | 361.0 ± 0.5 | 370.4 ± 0.4 | 5.640 ± 0.007 | 0.3152 |
+| 512 | 128 | 9.34 ± 0.05 | 720.1 ± 4.0 | 729.5 ± 4.0 | 5.626 ± 0.032 | 0.3175 |
+| 512 | 256 | 9.45 ± 0.10 | 1451.0 ± 10.2 | 1460.5 ± 10.1 | 5.668 ± 0.040 | 0.3353 |
+| 768 | 32 | 8.35 ± 1.23 | 179.3 ± 0.3 | 187.7 ± 1.1 | 5.604 ± 0.009 | 0.3486 |
+| 768 | 64 | 7.56 ± 0.04 | 357.3 ± 3.1 | 364.8 ± 3.1 | 5.583 ± 0.048 | 0.3497 |
+| 768 | 128 | 8.07 ± 0.63 | 713.8 ± 5.9 | 721.9 ± 6.2 | 5.577 ± 0.046 | 0.3511 |
+| 768 | 256 | 7.67 ± 0.12 | 1425.9 ± 11.9 | 1433.6 ± 11.8 | 5.570 ± 0.047 | 0.3555 |
+
+The 13.28 ± 6.61 ms prefill at prompt 512 / output 32 is caused by a single slow first run (20.9 ms) at a new prompt length (see Part 0). The other two runs took 9.7 and 9.3 ms.
+
+**Summary statistics.**
+- **Prefill:** with the slow first runs excluded (reps 1–2 only), prefill is 7.5, 8.1, 9.4 and 7.9 ms for prompts of 128, 256, 512 and 768 tokens. That is nearly flat across a 6× change in prompt length.
+- **Decode:** a linear fit of decode latency against output length gives a slope of **5.64 ms/token**, an intercept of −1.5 ms, and **R² = 0.9998**.
+- **TPOT:** across all 16 configurations it ranges from 5.53 to 5.74 ms (mean 5.63 ms, a spread of about ±2%).
+
+### Task 1.2 — Plots
+
+![Prompt length vs prefill latency](plots/part1_prefill_vs_prompt.png)
+
+![Output length vs decode latency](plots/part1_decode_vs_output.png)
+
+![Output length vs TPOT](plots/part1_tpot_vs_output.png)
+
+![Prompt length vs TPOT](plots/part1_tpot_vs_prompt.png)
+
+PDF versions of each figure are in `plots/`.
 
 ### Analysis
 
-1. **Why does prompt length affect prefill?** _TODO_
-2. **Why does output length affect decode?** _TODO_
-3. **Why can prefill expose more GPU parallelism than decode?** _TODO_
-4. **Which phase appears more compute intensive?** _TODO_
-5. **Which phase appears more memory-bandwidth sensitive?** _TODO_
-6. **Does TPOT remain constant as the context grows? If not, why?** _TODO_
+Reference numbers used below:
+- A100-SXM4-80GB FP16 Tensor Core peak: about 312 TFLOP/s. Measured earlier: 243 TFLOP/s on an 8192² matmul.
+- HBM bandwidth: about 2.0 TB/s.
+- gpt2 FP16 weights: 124.4M params × 2 B ≈ 249 MB.
+- KV cache per token: 2 × 12 layers × 12 heads × 64 × 2 B = 36,864 B ≈ 36 KiB.
+
+**1. Why does prompt length affect prefill?**
+
+Prefill runs every prompt token through every layer in one forward pass. The linear layers cost about 2 × (parameters) FLOPs per token, so their work grows linearly with prompt length *n*. Self-attention compares every token with every earlier token, so its work and its score matrix grow as *n*².
+
+In principle, then, prefill latency should rise with *n*. In our measurements it barely does: the clean runs went from 7.5 ms at 128 tokens to 7.9 ms at 768 tokens. The work is simply too small to fill the GPU. A 768-token prefill is about 2 × 124.4M × 768 ≈ 1.9 × 10¹¹ FLOPs, which takes about **0.8 ms** at our measured 243 TFLOP/s. The measured time is about 7.6 ms. Roughly 90% of prefill time is therefore a fixed per-forward-pass cost: Python and Hugging Face module dispatch, plus launching a few hundred small kernels across 12 layers. That cost does not depend on *n*.
+
+The slightly higher time at 512 tokens (about 9.4 ms) than at 768 (about 7.9 ms) is also consistent with an overhead-dominated regime. The library selects different GEMM/attention kernels for different sequence shapes, and at this scale those per-shape differences outweigh the extra FLOPs.
+
+Prompt length *does* clearly show up in memory, through the tensors prefill creates. Moving from 128 to 768 tokens raises peak memory by 87.2 MiB (269.8 → 357.0 MiB at output 32). That matches the prediction for 640 extra tokens:
+- full-prompt logits: 640 × 50,257 vocab × 2 B ≈ 61.4 MiB;
+- KV cache: 640 × 36 KiB ≈ 22.5 MiB;
+- total predicted: 83.9 MiB.
+
+The same per-token estimate (≈ 0.131 MiB per prompt token) also predicts the 128 → 256 step (16.8 MiB predicted, 17.0 MiB measured).
+
+**2. Why does output length affect decode?**
+
+Autoregressive decoding is sequential. Token *t* + 1 depends on token *t*, so *m* output tokens require *m* forward passes that cannot run in parallel. Decode latency is therefore proportional to *m*. Our data fits this almost perfectly: decode latency = 5.64 ms × *m* − 1.5 ms, with R² = 0.9998. The four prompt-length lines in the decode plot lie on top of each other.
+
+**3. Why can prefill expose more GPU parallelism than decode?**
+
+In prefill, the activations entering each layer form an *n* × 768 matrix, so every weight matrix multiplies against *n* rows at once. The GPU can spread those rows across thousands of cores and Tensor Cores, and the weights are loaded from memory once and reused *n* times.
+
+In decode, the input is a single 1 × 768 row. Each layer becomes a matrix-vector product with very little independent work per kernel. Most of the GPU sits idle, and each weight is used for only one token before the next step reloads it.
+
+Our numbers show this directly. Processing **768 tokens in one prefill takes about 7.6 ms, while generating one token takes 5.6 ms**. Per token, prefill costs about 0.010 ms versus 5.6 ms for decode, roughly **570× cheaper**.
+
+**4. Which phase appears more compute intensive?**
+
+**Prefill.** Its arithmetic intensity (FLOPs per byte loaded) is high. Each FP16 weight (2 B) is used in about 2*n* FLOPs, so intensity is about *n* FLOP/byte. That is 128–768 FLOP/byte for our prompts, at or above the A100's balance point of about 312 TFLOP/s ÷ 2.0 TB/s ≈ 150 FLOP/byte. Prefill FLOPs also grow with *n* (and *n*² for attention), while decode does almost no arithmetic per step: about 2.5 × 10⁸ FLOPs, roughly 1 µs of work at the A100's measured throughput.
+
+In our gpt2 runs, prefill latency is not yet *dominated* by compute, because only about 0.8 ms of its 7.6 ms is arithmetic. But it is the phase whose cost would scale with compute for a larger model or a longer prompt.
+
+**5. Which phase appears more memory-bandwidth sensitive?**
+
+**Decode.** Every decode step must read all the weights (about 249 MB) plus the whole KV cache, only to produce one token. Its arithmetic intensity is about 1 FLOP/byte, far below the A100's balance point. That puts decode firmly in the memory-bound regime: the speed limit is how fast bytes come from HBM, not how fast the GPU computes.
+
+For gpt2 specifically, even this bound is small. 249 MB at 2.0 TB/s ≈ **0.12 ms**, yet our measured TPOT is 5.6 ms, about 45× higher. The remaining time is fixed per-step overhead (Python, Hugging Face module dispatch, and launching hundreds of small kernels per step). Our measurement is therefore *overhead-bound*, which is a worse version of the same problem: the GPU does very little useful work per step.
+
+Decode is the phase sensitive to anything that adds bytes per step (larger weights, longer KV cache). Prefill is limited by arithmetic and does not have this problem. Batching (Part 3) is the standard fix: it reuses each weight read across many sequences.
+
+**6. Does TPOT remain constant as the context grows? If not, why?**
+
+**In our measurements, yes, to within noise.** TPOT stays between 5.53 and 5.74 ms (±2%) across every configuration. There is no consistent trend with prompt length: averaged over output lengths it is 5.59, 5.69, 5.64 and 5.58 ms for prompts of 128, 256, 512 and 768. Nor is there a trend with output length: 5.63, 5.62, 5.62 and 5.64 ms for outputs of 32, 64, 128 and 256.
+
+**In principle, TPOT should grow with context.** At decode step *t*, attention has to read the K and V of all *n* + *t* earlier tokens, so the bytes read and the attention FLOPs per step grow linearly with context length.
+
+The effect is invisible here because it is tiny compared with the fixed overhead. At the largest context we ran (1024 tokens), the KV cache is 1024 × 36 KiB ≈ 36 MiB. Reading it takes about 0.018 ms at 2.0 TB/s, about **0.3% of a 5.6 ms step**, which is below our run-to-run variation (std ≈ 0.01–0.09 ms).
+
+For a larger model, long contexts, or large batches, the KV read per step becomes comparable to or larger than the weight read, and TPOT rises roughly linearly with context. That effect is what makes long-context serving expensive (see Part 2).
 
 ---
 
