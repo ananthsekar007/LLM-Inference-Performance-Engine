@@ -1,7 +1,7 @@
 # CSE 598 — LLM Serving Systems: Assignment Report
 
-**Name:** _TODO_
-**Date:** _TODO_
+**Name:** Ananth Sundararajan Sekar
+**Date:** October 30, 2026
 
 ---
 
@@ -739,15 +739,133 @@ The starter setting reports **2.4× more requests/s** for a different, easier wo
 
 Design a policy for a single-GPU service with continuous arrivals and heterogeneous requests that meets the TTFT and TPOT SLOs while maximizing throughput. Cover each topic below and discuss tradeoffs.
 
-1. **Request scheduling:** _TODO_
-2. **Continuous / dynamic batching:** _TODO_
-3. **Prefill vs. decode scheduling:** _TODO_
-4. **KV-cache allocation:** _TODO_
-5. **Handling long-context requests:** _TODO_
-6. **Admission control:** _TODO_
-7. **Overload behavior:** _TODO_
+### Goals and the facts the design is built on
 
-**Tradeoffs:** _TODO_
+The service must keep
+
+$$
+\text{P95(TTFT)} < T_{TTFT} = 1\ \text{s} \qquad \text{and} \qquad \text{P95(TPOT)} < T_{TPOT} = 50\ \text{ms/token}
+$$
+
+while maximizing throughput. We treat **goodput** (requests per second that meet *both* SLOs) as the quantity to maximize, because raw throughput can always be raised by letting latency grow. The controllers below aim at **80% of each target** (0.8 s TTFT, 40 ms TPOT), so that bursts and measurement noise do not push the 95th percentile over the limit.
+
+The policy is built on what Parts 1–4 measured on our A100:
+
+| Measured fact | Source | Design consequence |
+|---|---|---|
+| A decode step costs about the same for 1 or 64 sequences (TPOT 5.5 → 5.8 ms); TPOT then rises to 6.4, 11.4 and 21.6 ms at 128, 256 and 512 | Part 3 | Decode batch size is the main TPOT control knob, and there is a measurable knee to operate at |
+| Prefill cost grows with the tokens in the batch; 65,536 prompt tokens took 205 ms | Parts 1, 3 | A large prefill inserted into a decode step stalls every running stream, so prefill must be bounded per step |
+| KV cache = 36 KiB/token for gpt2 (128 KiB/token for an 8B-class model) and grows with every generated token | Part 2 | Memory, not compute, caps concurrency; it must be allocated incrementally |
+| Static batching wasted 57–63% of prompt and decode work on padding and finished requests | Part 4 | Batch membership must change every iteration (continuous batching) |
+| vLLM ran ≤ 1.54 ms per iteration vs about 5.5–7 ms for eager Hugging Face | Parts 1, 4 | Use a serving engine with CUDA graphs and fused kernels; the scheduler's budgets assume this per-step cost |
+
+The design below therefore assumes a vLLM-style engine (paged KV cache, continuous batching, chunked prefill, CUDA graphs) and specifies the **policy** that runs on top of it.
+
+### Checking the SLOs against our measurements
+
+**TPOT < 50 ms.**
+- In Part 3, every batch size we ran met the TPOT target, even with eager Hugging Face: TPOT was 5.5 ms at batch 1 and 21.6 ms at batch 512 (prompt 128, output 128).
+- Beyond saturation, decode cost about 42 µs per sequence per step, so a 40 ms step budget corresponds to roughly 950 concurrent gpt2 sequences at these context lengths. This is a rough extrapolation, and longer contexts lower it.
+- **For gpt2 on an A100, TPOT is therefore not the binding constraint at realistic loads.** The same SLO becomes binding for larger models. An 8B-class model must read about 16 GB of weights every step, which is at least about 8 ms at 2 TB/s before any KV reads, so the decode batch would have to stop growing much earlier. This is why B_max is driven by measured TPOT (Section 2) rather than fixed.
+
+**TTFT < 1 s.**
+- Prefill alone is far below the target: 7.7 ms for one 128-token prompt and 205 ms for 512 prompts at once (Part 3).
+- With continuous arrivals, though, **TTFT is dominated by queueing**: time waiting to be admitted, and time waiting for earlier prefills.
+- Part 4 shows what scheduling does to this. With all 50 requests ready at t = 0:
+  - **Static batching misses the target badly.** At batch 16, a request in batch *k* waits for *k* − 1 earlier batches of about 1.78 s each before its own prefill starts. The 34 requests in batches 2–4 (68%) therefore see TTFTs of about 1.8, 3.6 and 5.3 s, and P95 TTFT is about 5.3 s.
+  - **vLLM completed every request within 0.394 s**, which bounds every TTFT below 1 s.
+- At the measured prefill rate (about 320k tokens/s for gpt2 at saturation), the 0.8 s TTFT budget covers roughly 250k prompt tokens of queued prefill. That figure is what admission control (Section 6) protects.
+
+**Operating point for this service:** on the gpt2/A100 setup, both SLOs are comfortably met at the Part 3 knee (batch about 128: TPOT 6.4 ms, prefill-only TTFT 56 ms). Throughput can therefore be pushed further, toward batch 256–512 (TPOT 11–22 ms), while staying under 50 ms. **The SLOs leave room to trade latency for throughput here, and the controllers in Sections 2–3 do exactly that** until measured P95 approaches 80% of either target.
+
+### 1. Request scheduling
+
+- **Two queues:**
+  - a *waiting* queue of requests that have not started prefill;
+  - a *running* set of requests that are prefilling or decoding.
+- **Order of the waiting queue: earliest TTFT deadline first** (deadline = arrival time + T_TTFT). With a single priority class this reduces to first-come-first-served, which is fair and starvation-free. Separate priority classes (e.g., interactive chat vs. batch jobs) are supported by giving each class its own deadline: batch jobs get a long or no TTFT deadline and fill leftover capacity.
+- **Running requests always take precedence over waiting ones** when the per-iteration budget is divided (Section 3). A user who is already streaming notices a stall immediately; a user whose first token is a few milliseconds later does not.
+- **Why not shortest-job-first?** Output length is unknown at arrival, and SJF can starve long requests. As a mild form of it, prompts that can be prefilled in a single chunk may be admitted ahead of long prompts with the same deadline, with **aging** so that a long prompt cannot be passed over indefinitely.
+
+### 2. Continuous / dynamic batching
+
+- **Iteration-level batching.** Every model step, finished requests leave immediately (their results are returned and KV blocks freed) and waiting requests are admitted into the freed capacity. This removes the padding and finished-row waste measured in Part 4 (43% prompt and 37% decode efficiency for static batching).
+- **The decode batch size is chosen by TPOT, not by throughput.** The scheduler keeps a **cap B_max** on the number of running sequences, and the steady-state decode step time must stay below T_TPOT with headroom (we use 80% of T_TPOT so bursts don't push P95 over).
+  - From Part 3, a cap near **128** gives 84% of the maximum throughput at only +17% TPOT over batch 1. Going from 128 to 512 adds only 19% more throughput but makes TPOT 3.4× worse (6.4 → 21.6 ms). The knee is the **starting point**. Because even 21.6 ms is well under the 40 ms working target, the controller below is allowed to grow B_max past it for extra throughput. With a larger model it would stop much earlier.
+  - B_max is **adapted online**: every few seconds the scheduler compares measured P95 TPOT to the target. If P95 exceeds the 80% target it lowers B_max multiplicatively; if there is slack it raises B_max additively (AIMD). This tracks changes in context length, since longer contexts make each step more expensive (Part 2).
+- **One flat token batch.** Sequences are packed without padding and attention runs on variable-length kernels, so mixing a 32-token and a 512-token request costs only their real tokens.
+
+### 3. Prefill vs. decode scheduling
+
+- **The problem.** Prefill and decode compete for the same GPU steps.
+  - Prioritizing prefill improves TTFT for new arrivals, but a large prefill in a step delays every running stream's next token, hurting TPOT. Part 3 measured 205 ms for one 65k-token prefill; inserted into decoding, that is a 200 ms pause for every active user.
+  - Prioritizing decode protects TPOT but lets TTFT grow without bound under load.
+- **Policy: chunked prefill with a per-iteration token budget *K*.**
+  - Each iteration first includes **one token for every running decode** (protecting TPOT), then fills the rest of the budget with **prefill chunks** from waiting requests in deadline order.
+  - A long prompt is split across several iterations.
+  - *K* is chosen so that one iteration (all decodes plus *K* − (#decodes) prefill tokens) still fits within the TPOT target.
+  - *K* is the direct knob between the two SLOs: larger *K* gives faster TTFT and higher prefill throughput; smaller *K* gives smoother TPOT. We start at *K* ≈ 2048 tokens (vLLM's default chunk size was 8192 on our A100), and the same AIMD controller nudges *K* down when TPOT is at risk and up when TTFT is at risk.
+- **Alternative.** With several GPUs, prefill and decode can run on separate instances (disaggregated serving) so they never interfere. On the single GPU in this challenge, chunked prefill is the practical form of that separation.
+
+### 4. KV-cache allocation
+
+- **Paged allocation.** At startup the engine reserves the KV pool from all memory not used by weights and activations, and divides it into fixed-size blocks (e.g., 16 tokens).
+  - Each sequence has a block table, and blocks are allocated **on demand** as the sequence grows. Fragmentation is limited to one partly filled block per sequence, and there is no up-front reservation for an unknown output length.
+  - On our A100 this pool was 72.24 GiB = 2.1M tokens of gpt2 KV (Part 4). For an 8B-class model it would be roughly 60 GB / 128 KiB ≈ 460k tokens, about 110 concurrent 4k-token requests (Part 2).
+- **Admission reserves the prompt plus a watermark.** A request is admitted only if its prompt blocks fit *and* at least a watermark (e.g., 5% of the pool) remains free. The watermark lets running sequences keep growing without immediate eviction.
+- **Preemption when the pool runs out.** If decoding needs a new block and none are free, the scheduler **preempts the most recently admitted, lowest-priority request**: it frees its blocks and moves it back to the head of the waiting queue.
+  - It is resumed by **recomputing** its prefill rather than swapping KV to CPU memory. For short and medium prompts, recompute is cheap: Part 1 prefilled 768 tokens in about 8 ms with Hugging Face, faster with a tuned engine.
+  - Swapping is reserved for very long contexts, where recompute is expensive.
+- **Prefix caching.** Blocks with a shared prefix (system prompts, multi-turn chat history) are reference-counted and reused. This saves both memory and prefill time. Our starter vLLM run showed the effect: identical `"hello …"` prompts made the workload 2.4× faster in requests/s.
+
+### 5. Handling long-context requests
+
+Long prompts are costly in three ways, and each needs its own control:
+
+1. **Prefill time.** TTFT can never be smaller than the prefill time, which grows with prompt length (linearly for the linear layers, quadratically for attention). **Chunked prefill** (Section 3) keeps a long prompt from stalling running decodes. **Admission** (Section 6) estimates the request's TTFT from its length; if even an empty queue could not meet T_TTFT, the request is placed in a long-context class with a relaxed, documented TTFT target rather than silently missing the SLO.
+2. **KV memory.** A 32k-token request on an 8B-class model holds about 4 GiB of KV, as much as eight 4k-token requests (Part 2). To keep long requests from crowding out short interactive ones, long-context requests may use **at most a fixed share of the KV pool** (e.g., 30%), and at most a fixed number of them may be prefilling at once.
+3. **Per-step cost.** Every decode step of a long-context request reads its whole KV cache, which raises the step time for everyone in the batch. The AIMD controller in Section 2 lowers B_max automatically when the average context grows. Long requests are also the first candidates for swap-based preemption (Section 4), since recomputing them is expensive.
+
+Prefix caching is especially valuable for long contexts that are reused (documents, long chat histories). A hard maximum context length (1024 tokens for gpt2) is enforced at admission.
+
+### 6. Admission control
+
+When a request arrives, the scheduler admits it to the waiting queue only if all three checks pass:
+
+1. **Memory.** Its prompt blocks plus the watermark fit in the free KV pool, either now or after requests expected to finish within its TTFT deadline release their blocks.
+2. **Predicted TTFT ≤ T_TTFT.** The prediction is (prefill tokens queued ahead of it + its own prompt length) ÷ measured prefill throughput under the current *K*, plus one iteration. The prefill rate is calibrated online. Part 3's batch-512 prefill gives a scale reference: about 320k tokens/s at saturation for gpt2.
+3. **Capacity.** The running batch stays below B_max, so admitting it does not push existing streams past T_TPOT.
+
+If a check fails, the request waits in a **bounded** queue. If it is still waiting when its predicted TTFT exceeds the deadline, it is **rejected early** (HTTP 429 with a `Retry-After` hint), not served late.
+
+Rejecting a few requests quickly protects the SLOs of all the others and gives clients a clear signal to retry or route elsewhere. Admitting everything makes every request miss its SLO under overload.
+
+A capacity estimate guides provisioning. By Little's law, sustainable request rate ≈ decode throughput at the chosen operating point ÷ average output length. For our gpt2 numbers: about 18.6k tokens/s at the batch-128 knee (Part 3) ÷ 92 output tokens per request (Part 4 workload) ≈ 200 requests/s. Arrival rates above that cannot be met with any scheduler.
+
+### 7. Overload behaviour
+
+When arrivals persistently exceed capacity, the policy degrades in this order, protecting requests already being served:
+
+1. **Protect running streams.** Never admit work that would push running requests past T_TPOT. B_max and *K* are lowered first, which trades TTFT for new requests against TPOT for current ones.
+2. **Shed by deadline.** Drop requests whose TTFT deadline has already passed, since serving them late wastes capacity. Then reject new arrivals early, with `Retry-After`.
+3. **Shed by priority and cost.** Pause batch-class requests, then stop admitting long-context requests, which consume the most prefill time and KV memory per request.
+4. **Reduce work per request.** Cap `max_tokens` for new requests during overload, a visible but graceful degradation compared with timeouts.
+5. **Avoid thrashing.** Limit the preemption rate and use hysteresis in the controllers, so the system does not repeatedly evict and recompute the same requests. If preemption increases, the admission thresholds are tightened.
+
+The metric watched throughout is **goodput** and **SLO attainment**, not raw tokens/s. Part 3 showed throughput can keep rising while every user's latency gets worse.
+
+### Tradeoffs
+
+| Decision | Gains | Costs | Our choice |
+|---|---|---|---|
+| Larger decode batch (B_max) | Throughput: 180 → 22k tokens/s from batch 1 to 512 (Part 3) | TPOT and TTFT rise sharply after the knee (TPOT 6.4 → 21.6 ms) | Start at the knee (about 128 for gpt2); grow while measured P95 TPOT < 40 ms (allows about 256–512 for gpt2) |
+| Larger prefill chunk *K* | Lower TTFT and higher prefill efficiency | Longer iterations, so TPOT spikes for running streams | Moderate *K*, tuned by whichever SLO is closer to violation |
+| Decode-first vs. prefill-first | Decode-first protects TPOT | New requests wait longer (TTFT) | Decode-first, with a guaranteed prefill share via *K* |
+| FCFS/deadline vs. shortest-job-first | Fairness; no starvation | Short requests can wait behind long prompts | Deadline order with limited, aged preference for short prompts |
+| Strict admission / early rejection | SLOs kept for admitted requests; predictable latency | Some requests refused even though they would eventually be served | Reject when predicted TTFT > target; bounded queue |
+| KV watermark and long-context quota | Fewer preemptions; short requests protected | Less concurrency, idle memory | Small watermark (about 5%); cap long-context share of the pool |
+| Recompute vs. swap on preemption | Recompute: no CPU memory or PCIe traffic | Redundant prefill compute (Part 2) | Recompute for short prompts, swap for long ones |
+| Prefix caching | Big TTFT and memory savings for shared prefixes (2.4× in Part 4) | Cached blocks occupy pool space; eviction policy needed | On, with LRU eviction of unreferenced blocks |
 
 ---
 
@@ -757,13 +875,29 @@ Design a policy for a single-GPU service with continuous arrivals and heterogene
 
 300–500 words: *Why is LLM serving fundamentally a systems problem rather than simply a model-inference problem?* Use evidence from the experiments.
 
-_TODO_
+### Reflection
+
+Every experiment in this assignment ran the same 124M-parameter gpt2 in FP16 on the same A100, with the same weights and the same arithmetic. Yet the measured performance varied by two orders of magnitude, and almost none of that variation came from the model. It came from how computation, memory and requests were organized around it. That is why LLM serving is a systems problem.
+
+First, the GPU is rarely limited by the model's math. In Part 1, a 768-token prefill needed only about 0.8 ms of arithmetic but took 7.6 ms, and each decode step took 5.6 ms when reading the weights should take about 0.12 ms. A single-token decode step is dominated by fixed per-step costs (Python dispatch, kernel launches, weight reads), not by FLOPs. Whether the hardware is used well depends on how work is grouped, not on the network itself.
+
+Second, the right optimization depends on the operating regime. The KV cache is a textbook algorithmic improvement, yet at batch 1 it made no measurable difference (0.99–1.06×) because per-step overhead hid the recomputation. At batch 32 it was 9.2× faster, and its benefit grew with sequence length exactly as predicted. Caching also turns a compute problem into a memory problem: 36 KiB per token for gpt2 means the KV cache, not compute, decides how many requests fit on the GPU.
+
+Third, throughput and latency are policy choices. In Part 3, batching raised throughput 123×, from 180 to 22,092 tokens/s, without changing the model. Beyond batch 128, however, the last 19% of throughput cost 3.4× worse per-user latency. No single "fastest" configuration exists. The operator must choose a point on the tradeoff curve that satisfies an SLO, which is a scheduling decision.
+
+Fourth, and most strikingly, Part 4 ran an identical workload, model, GPU and precision through two serving strategies. Static batching wasted 57–63% of its prompt and decode work on padding and finished requests, and its P95 time to first token was about 5.3 s. vLLM, using continuous batching, paged KV memory and CUDA graphs, served the same 50 requests 15–72× faster and finished all of them within 0.4 s. Its log reported 36.0 KiB per KV token, the same quantity we derived in Part 2. The difference was entirely in scheduling, memory management and kernel execution.
+
+Finally, the operational problems we hit were classic systems issues: allocator fragmentation that reserved 80 GB for a few GB of live data, an engine that silently chose bfloat16, and a missing compiler that prevented startup.
+
+Model inference answers "what does this network compute for one input?" Serving must answer how to share one GPU's compute, memory capacity and bandwidth among many requests whose lengths and arrival times are unknown, under latency targets that conflict with throughput. Those are the questions of scheduling, caching, virtual memory and admission control, which makes LLM serving fundamentally a systems problem.
 
 ---
 
 ## Reproducibility
 
-_TODO: point to README.md, which lists environment setup, the exact command for each part, and how the plots are generated._
+[`README.md`](README.md) gives everything needed to reproduce these results: the Sol environment setup (`setup.sh`), the extra CUDA/`ninja` setup vLLM needed, the exact command for every experiment, how each plot was generated, and a list of every change made to the starter code.
+
+All raw per-repetition results and their mean/std aggregates are in `results/`, and every figure (PDF and PNG) is in `plots/`.
 
 ## Deliverables
 
