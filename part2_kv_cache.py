@@ -121,7 +121,10 @@ def generate_without_cache(model, input_ids, output_length):
         # so every step must re-process all tokens in `sequence`.
         # Be sure to pass `use_cache=False`.
         # --------------------------------------------------------
-        outputs = None  # replace this line
+        outputs = model(
+            input_ids=sequence,
+            use_cache=False,
+        )
 
         # --------------------------------------------------------
         # TODO (b): Greedily predict the next token.
@@ -130,13 +133,17 @@ def generate_without_cache(model, input_ids, output_length):
         # vocabulary. Keep the result shaped [batch, 1] so it can be
         # concatenated to `sequence` (see generate_with_cache()).
         # --------------------------------------------------------
-        next_token = None  # replace this line
+        next_token = torch.argmax(
+            outputs.logits[:, -1, :],
+            dim=-1,
+            keepdim=True,
+        )
 
         # --------------------------------------------------------
         # TODO (c): Append the new token to the complete sequence
         # along the sequence dimension (dim=1).
         # --------------------------------------------------------
-        sequence = sequence  # replace this line
+        sequence = torch.cat([sequence, next_token], dim=1)
 
     return sequence
 
