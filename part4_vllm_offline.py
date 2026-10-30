@@ -56,6 +56,7 @@ def main():
     )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--out", default="part4_vllm.csv")
+    parser.add_argument("--dtype", default="float16")
     args = parser.parse_args()
 
     workload = load_workload(args.workload)
@@ -65,7 +66,7 @@ def main():
         for r in workload
     ]
 
-    llm = LLM(model=args.model)
+    llm = LLM(model=args.model, dtype=args.dtype)
 
     # Simple common max-token setting for an offline comparison.
     # TODO 4:
