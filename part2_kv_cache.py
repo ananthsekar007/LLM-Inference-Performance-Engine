@@ -242,6 +242,20 @@ def main():
         help="Output CSV file",
     )
 
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of sequences generated together",
+    )
+
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Measured runs per configuration",
+    )
+
     args = parser.parse_args()
 
     # Reproducibility
@@ -308,7 +322,15 @@ def main():
         dev=dev,
     )
 
-    for output_length in [32, 128, 256]:
+    if args.batch_size > 1:
+        input_ids = synthetic_tokens(
+            batch_size=args.batch_size,
+            seq_len=prompt_length,
+            vocab_size=model.config.vocab_size,
+            dev=dev,
+        )
+
+    for output_length in [32, 128, 256, 512, 896]:
 
         sequences = {}
 
@@ -328,6 +350,23 @@ def main():
 
             rows.append(result)
             sequences[use_cache] = sequence
+            rows[-1]["rep"] = 0
+
+            for rep in range(1, args.repeats):
+                print(
+                    f"output_length={output_length}, "
+                    f"use_cache={use_cache}, rep={rep}"
+                )
+
+                result, _ = benchmark(
+                    model=model,
+                    input_ids=input_ids,
+                    output_length=output_length,
+                    use_cache=use_cache,
+                )
+
+                result["rep"] = rep
+                rows.append(result)
 
         # -----------------------------
         # Agreement check
@@ -358,6 +397,11 @@ def main():
             row["exact_match"] = exact_match
             row["match_rate"] = match_rate
 
+        for row in rows[-2 * args.repeats:]:
+            row["batch_size"] = args.batch_size
+            row["exact_match"] = exact_match
+            row["match_rate"] = match_rate
+
     # -----------------------------
     # Save benchmark results
     # -----------------------------
@@ -370,6 +414,26 @@ def main():
     df.to_csv(args.out, index=False)
 
     print(f"\nResults saved to {args.out}")
+
+    group_cols = ["batch_size", "use_cache", "prompt_length", "output_length"]
+    mean_df = (
+        df.groupby(group_cols)
+        .mean(numeric_only=True)
+        .reset_index()
+        .drop(columns=["rep"])
+    )
+    std_df = (
+        df.groupby(group_cols)
+        .std(numeric_only=True)
+        .reset_index()
+        .drop(columns=["rep"])
+    )
+
+    print("\nMean over repeats:")
+    print(mean_df.to_string(index=False))
+
+    mean_df.to_csv(args.out.removesuffix(".csv") + "_mean.csv", index=False)
+    std_df.to_csv(args.out.removesuffix(".csv") + "_std.csv", index=False)
 
 
 if __name__ == "__main__":
