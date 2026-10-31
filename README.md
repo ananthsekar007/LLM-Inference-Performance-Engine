@@ -1,101 +1,140 @@
 # CSE 598 — LLM Serving Systems Assignment
 
-**Author:** Ananth Sundararajan Sekar
+**Author:** Ananth Sundararajan Sekar (ASU ID: 1237228176)
 
-This repository measures the systems behaviour of autoregressive LLM serving: prefill vs. decode, KV caching, batching, and static batching vs. a modern serving engine (vLLM). The analysis and results are in [`REPORT.md`](REPORT.md).
+This project measures the systems behaviour of autoregressive LLM serving: prefill vs. decode, KV caching, batching, and static batching vs. a modern serving engine (vLLM). The report is `Ananth_Sundararajan_Sekar_CSE598_Assignment3_Report.docx`.
 
 | | |
 |---|---|
 | Model | `gpt2` (124M parameters, 1024-token context), FP16 everywhere |
-| Hardware | One NVIDIA A100-SXM4-80GB on ASU Sol (full environment in [`results/env.txt`](results/env.txt)) |
+| Hardware | One NVIDIA A100-SXM4-80GB on ASU Sol (full environment in `results/env.txt`) |
 | Software | Python 3.11.18, PyTorch 2.13.0+cu130, Transformers 5.19.0, vLLM 0.32.0 |
-| Methodology | One warm-up before measuring, model loading excluded, 3 repetitions per configuration, mean ± std reported |
+| Methodology | One warm-up before measuring, model loading excluded, 3 repetitions per configuration, mean reported |
 
-## Repository layout
+## Files
 
 | Path | Purpose |
 |---|---|
 | `setup.sh` | Creates and activates the `llmserve` conda env on Sol; optionally records the environment |
 | `utils.py` | Shared helpers: seeding, GPU-synchronized timing, peak-memory tracking, synthetic tokens |
-| `part1_prefill_decode.py` | Part 1: prefill / decode latency, TPOT and memory over prompt × output lengths |
+| `part1_prefill_decode.py` | Part 1: prefill/decode latency, TPOT and memory over prompt × output lengths |
 | `part2_kv_cache.py` | Part 2: generation with vs. without the KV cache (`--batch-size`, `--repeats`) |
 | `part2_kv_size.py` | Part 2: analytical KV-cache size calculator |
-| `part3_batching.py` | Part 3: batch-size sweep (1–512): TTFT, TPOT, latency, throughput, memory |
+| `part3_batching.py` | Part 3: batch-size sweep (1–512) |
 | `workload.py` | Part 4: generates the 50-request heterogeneous workload (`workload.json`, seed 42) |
 | `part4_static_batching.py` | Part 4: Hugging Face static batching over the workload |
 | `part4_vllm_offline.py` | Part 4: vLLM offline engine over the same workload |
-| `plot_results.py` | Generates every plot from the CSVs |
+| `plot_results.py` | Generates the per-part plots in `plots/` |
 | `results/` | All CSV results (raw per run, `_mean`, `_std`) and `env.txt` |
-| `plots/` | All figures (PDF, and PNG for the report) |
-| `REPORT.md` | The report |
+| `plots/` | All figures (PDF and PNG) |
 
-## 1. Environment setup (ASU Sol)
+## How to run everything
 
-All experiments were run **interactively** on a Sol GPU node.
+These steps assume you have the project as a zip file and run everything on ASU Sol in an **interactive shell on a GPU node**. Replace the placeholders:
+- `<ASURITE>`: your ASU username;
+- `<project-zip>`: the name of the zip file;
+- `<project-folder>`: the folder you unzip it into.
+
+`results/` and `plots/` already contain the results reported in the report. Re-running an experiment overwrites the matching files.
+
+### Step 1: Copy the project to Sol (your computer)
 
 ```bash
-ssh <asurite>@login.sol.rc.asu.edu
+scp <project-zip>.zip <ASURITE>@login.sol.rc.asu.edu:~/
+```
+
+You can also upload the zip through the Sol web portal (https://sol.asu.edu, Files menu).
+
+### Step 2: Log in and start a persistent session (your computer → Sol login node)
+
+```bash
+ssh <ASURITE>@login.sol.rc.asu.edu
 tmux new -s llm
-interactive -p general -q public -G a100:1 -c 8 --mem=32G -t 0-03:00
-cd ~/Desktop/LLM-Inference-Performance-Engine
+```
+
+`tmux` keeps the session alive if the connection drops. Reattach later with `tmux attach -t llm`.
+
+### Step 3: Unzip the project (Sol login node)
+
+```bash
+unzip <project-zip>.zip -d <project-folder>
+```
+
+`<project-folder>` should directly contain `setup.sh` and the `part*.py` scripts. If the zip has its own top-level folder, use that folder as `<project-folder>` in the steps below.
+
+### Step 4: Request a GPU interactively (Sol login node)
+
+```bash
+salloc -G a100:1
+```
+
+This allocates one A100 and opens a shell on a GPU node. Check the GPU:
+
+```bash
+nvidia-smi
+```
+
+### Step 5: Set up the environment (GPU node)
+
+```bash
+cd ~/<project-folder>
 source setup.sh --env-info
 ```
 
-`setup.sh` must be **sourced**, not executed, so that the activated environment stays in your shell. It:
+**`setup.sh` must be sourced before running anything else, in every new shell on the GPU node.** Every command in Steps 6–12 assumes the environment it sets up.
+
+It must be **sourced**, not run with `bash`, so the activated environment stays in your shell. It:
 - loads `mamba/latest`;
 - points the Hugging Face, pip and conda caches at `/scratch/$USER`;
-- creates `llmserve` with Python 3.11 if it doesn't exist, then activates it;
-- installs vLLM first (it pins its own `torch` and `transformers`), then the remaining packages;
-- pre-downloads gpt2 and checks that CUDA sees a GPU.
+- creates the `llmserve` env with Python 3.11 if it doesn't exist, then activates it;
+- installs vLLM first (it pins its own `torch`/`transformers`), then `accelerate`, `pandas`, `numpy` and `matplotlib`;
+- installs `ninja` and loads the CUDA module `cuda-13.4.3-gcc-13.2.0` so `nvcc` is available, then sets `CUDA_HOME`. vLLM needs these in Part 4 (see Step 10). To use a different module, run `CUDA_MODULE=<name> source setup.sh`;
+- pre-downloads gpt2 and checks that CUDA sees the GPU.
 
-With `--env-info` it also writes `results/env.txt`. On later sessions, `source setup.sh` only re-activates the env.
+The first run creates the env and installs the packages, which takes several minutes. Later runs skip anything already installed, so in later sessions just use `source setup.sh`.
 
-To install the packages without the script, install vLLM first and then the rest:
+`--env-info` also writes `nvidia-smi` plus the Python/PyTorch/CUDA/cuDNN/Transformers/vLLM versions to `results/env.txt`. It only needs to be used once.
 
-```bash
-pip install vllm
-pip install -r requirements.txt
+### Step 6: Part 0, timing check for Question 0.1 (GPU node)
+
+Run in `python`:
+
+```python
+import torch, time
+a = torch.randn(8192, 8192, device="cuda", dtype=torch.float16)
+for _ in range(3): a @ a
+torch.cuda.synchronize()
+
+s = time.perf_counter(); b = a @ a; e = time.perf_counter()
+print("no sync  (ms):", (e - s) * 1000)
+torch.cuda.synchronize()
+
+torch.cuda.synchronize(); s = time.perf_counter(); b = a @ a; torch.cuda.synchronize(); e = time.perf_counter()
+print("with sync (ms):", (e - s) * 1000)
 ```
 
-### Extra setup for vLLM (Part 4 only)
+Reported result: 0.084 ms without synchronization, 4.528 ms with it.
 
-vLLM 0.32 compiles a FlashInfer sampling kernel at startup, which needs `nvcc` and `ninja`. Without them it fails with `Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist`. Fix:
-
-```bash
-module avail cuda
-module load <cuda module closest to 13.0>
-pip install ninja
-export CUDA_HOME=$(dirname $(dirname $(which nvcc)))
-```
-
-## 2. Running the experiments
-
-Run every command from the repository root on the GPU node. Each script writes a raw CSV (one row per repetition) plus `_mean.csv` and `_std.csv` next to it.
-
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` is used for Parts 2–4. Without it, the growing tensors in no-cache and large-batch runs fragment PyTorch's caching allocator, which then hits OOM and retries, distorting the timings.
-
-### Part 0: environment and timing check
-
-```bash
-source setup.sh --env-info
-```
-
-The synchronize-vs-no-synchronize matmul timing used for Question 0.1 is in `REPORT.md`, Part 0.
-
-### Part 1: prefill and decode (about 2 min)
+### Step 7: Part 1, prefill and decode (GPU node, about 2 min)
 
 ```bash
 python part1_prefill_decode.py --out results/part1_prefill_decode.csv
 ```
 
-Prompt lengths are 128/256/512/768 and output lengths 32/64/128/256 (prompt + output ≤ 1024, gpt2's limit). Each configuration is repeated 3 times.
+Prompts 128/256/512/768 × outputs 32/64/128/256, 3 repetitions each. Writes `results/part1_prefill_decode.csv` (raw), `_mean.csv` and `_std.csv`.
 
-### Part 2: KV cache (batch 1: a few minutes; batch 32: about 10 min)
+### Step 8: Part 2, KV cache (GPU node)
+
+Batch 1 takes a few minutes; batch 32 takes about 10 minutes:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python part2_kv_cache.py --batch-size 1 --out results/part2_kv_cache_b1.csv
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python part2_kv_cache.py --batch-size 32 --out results/part2_kv_cache_b32.csv
 ```
+
+`expandable_segments:True` is needed at batch 32. Without the cache, every step allocates slightly larger tensors, which fragments PyTorch's caching allocator until it hits OOM and retries, adding time to the measurements.
+
+`results/part2_kv_cache.csv` is an earlier single-run smoke test that is not used in the report. It was produced by `python part2_kv_cache.py --out results/part2_kv_cache.csv`.
 
 KV-cache size checks (no GPU needed):
 
@@ -105,38 +144,56 @@ python part2_kv_size.py --batch-size 32 --layers 12 --kv-heads 12 --head-dim 64 
 python part2_kv_size.py
 ```
 
-The first two use gpt2's configuration. The third uses the script's defaults, a Llama-8B-style configuration.
+These are gpt2 at 1 and 32 sequences (36 MiB and 1.125 GiB), and the script's default Llama-8B-style configuration (512 MiB).
 
-`results/part2_kv_cache.csv` is an earlier single-run smoke test (output lengths 32/128/256) and is not used in the report tables.
-
-### Part 3: batching (a few minutes)
+### Step 9: Part 3, batching (GPU node, a few minutes)
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python part3_batching.py --out results/part3_batching.csv
 ```
 
-Batch sizes 1, 2, 4, …, 512 with prompt 128 and output 128.
+Batch sizes 1, 2, 4, …, 512 with prompt 128 and output 128, 3 repetitions each.
 
-### Part 4: static batching vs. vLLM (a few minutes)
+### Step 10: Part 4, static batching vs. vLLM (GPU node)
+
+Generate the workload (deterministic, seed 42):
 
 ```bash
 python workload.py --n 50
+```
 
-for b in 1 4 8 16; do
-  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python part4_static_batching.py --batch-size $b --out results/part4_static_b$b.csv
-done
+Static batching at four batch sizes:
 
+```bash
+for b in 1 4 8 16; do PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python part4_static_batching.py --batch-size $b --out results/part4_static_b$b.csv; done
+```
+
+vLLM needs a compiler on Sol. At startup, FlashInfer compiles its sampling kernel and fails with `Could not find nvcc` unless the CUDA toolkit and `ninja` are available. `setup.sh` (Step 5) takes care of this. Before running vLLM, confirm that `nvcc` is on the path:
+
+```bash
+which nvcc && echo $CUDA_HOME
+```
+
+If it prints nothing, pick a module from `module avail cuda` and re-source `setup.sh` with it:
+
+```bash
+CUDA_MODULE=<cuda module name> source setup.sh
+```
+
+Then run vLLM on the exact workload, and once more with the original starter settings for the TODO 4 comparison:
+
+```bash
 python part4_vllm_offline.py --out results/part4_vllm.csv
 python part4_vllm_offline.py --no-exact-workload --out results/part4_vllm_starter.csv
 ```
 
-- **`workload.json`** is deterministic (seed 42): 11,040 prompt tokens and 4,592 output tokens. Prompts are capped at 512 so that every request fits gpt2's context.
-- **`part4_vllm_offline.py`** defaults to `--exact-workload`: exact-length token prompts and per-request `max_tokens` with `ignore_eos=True`, so vLLM does the same work as static batching. It also forces `--dtype float16`, because vLLM's `auto` dtype would load gpt2 in bfloat16. Each repetition uses fresh random prompts so prefix caching cannot reuse earlier ones.
-- **`--no-exact-workload`** reproduces the original starter configuration (`"hello "` prompts, a single `max_tokens=64`). It is used only for the TODO 4 comparison in the report.
+- **Exact workload (default):** exact-length token prompts, per-request `max_tokens` with `ignore_eos=True`, and `dtype=float16`. vLLM's default would load gpt2 in bfloat16.
+- **Starter settings:** `--no-exact-workload` uses `"hello "` prompts and a single `max_tokens=64`.
+- **Check:** confirm the vLLM startup log shows `dtype=torch.float16`.
 
-## 3. Generating the plots
+### Step 11: Generate the plots (GPU node or login node)
 
-`plot_results.py` saves figures into the current directory, so run it from `plots/`:
+`plot_results.py` saves into the current directory, so run it from `plots/`:
 
 ```bash
 cd plots
@@ -148,9 +205,15 @@ python ../plot_results.py --part4 ../results
 cd ..
 ```
 
-`--part2` takes one CSV per call; the batch size is read from the file and added to the plot filenames. The starter's `part2_kv_latency.pdf` has a fixed name and is overwritten by the last call. `--part4` takes the results directory.
+### Step 12 (optional): Copy results to your computer (your computer, not Sol)
 
-## 4. Results and figures
+```bash
+scp -r <ASURITE>@login.sol.rc.asu.edu:~/<project-folder>/results <ASURITE>@login.sol.rc.asu.edu:~/<project-folder>/plots .
+```
+
+`scp` has to be run on your own computer. Running it from inside Sol tries to SSH back into Sol and hangs.
+
+## Results and figures
 
 | Part | Results | Figures |
 |---|---|---|
@@ -160,7 +223,7 @@ cd ..
 | 3 | `results/part3_batching{,_mean,_std}.csv` | `plots/part3_*`, `plots/batch_vs_*.pdf` |
 | 4 | `results/part4_static_b{1,4,8,16}{,_mean,_std}.csv`, `results/part4_vllm{,_starter}{,_mean,_std}.csv`, `workload.json` | `plots/part4_*` |
 
-## 5. Changes to the starter code
+## Changes to the starter code
 
 All changes are additions, except for a few one-line edits noted here.
 

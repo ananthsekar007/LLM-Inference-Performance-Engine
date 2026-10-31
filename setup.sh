@@ -2,8 +2,11 @@
 # Environment setup for the CSE 598 LLM serving assignment on ASU Sol.
 #
 # Run on a GPU node, and SOURCE it so the activated env stays in your shell:
-#     source setup.sh            # load modules, create/activate env, set caches
+#     source setup.sh            # load modules, create/activate env, set caches,
+#                                # install packages and the CUDA compiler vLLM needs
 #     source setup.sh --env-info # also write results/env.txt
+#
+# Every experiment in README.md assumes this has been sourced in the current shell.
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     echo "Run this with 'source setup.sh', not 'bash setup.sh'."
@@ -46,6 +49,26 @@ if ! python -c "import accelerate, pandas, numpy, matplotlib" 2>/dev/null; then
     pip install accelerate pandas numpy matplotlib || return 1
 fi
 
+# vLLM's FlashInfer sampler compiles a kernel at startup and needs nvcc and ninja.
+# Uses cuda-13.4.3-gcc-13.2.0 by default; override with: CUDA_MODULE=<name> source setup.sh
+if ! python -c "import ninja" 2>/dev/null; then
+    echo "Installing ninja..."
+    pip install ninja || return 1
+fi
+
+CUDA_MODULE=${CUDA_MODULE:-cuda-13.4.3-gcc-13.2.0}
+if ! command -v nvcc >/dev/null 2>&1; then
+    echo "Loading CUDA module $CUDA_MODULE for nvcc..."
+    module load "$CUDA_MODULE" || echo "WARNING: could not load $CUDA_MODULE."
+fi
+
+if command -v nvcc >/dev/null 2>&1; then
+    export CUDA_HOME=$(dirname "$(dirname "$(command -v nvcc)")")
+else
+    echo "WARNING: nvcc not found, so vLLM (Part 4) will fail to start."
+    echo "Run 'module avail cuda', then: CUDA_MODULE=<name> source setup.sh"
+fi
+
 mkdir -p results plots
 
 python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoTokenizer.from_pretrained('gpt2'); AutoModelForCausalLM.from_pretrained('gpt2')" \
@@ -65,4 +88,4 @@ if [[ "$1" == "--env-info" ]]; then
     echo "Wrote results/env.txt"
 fi
 
-echo "Environment '$ENV_NAME' active (Python $ACTUAL_PY). HF_HOME=$HF_HOME"
+echo "Environment '$ENV_NAME' active (Python $ACTUAL_PY). HF_HOME=$HF_HOME CUDA_HOME=$CUDA_HOME"
